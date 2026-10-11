@@ -28,7 +28,8 @@ A target version drags its prerequisites along, and the user rarely names them. 
 1. **From the targets, derive the prerequisites** — minimum and maximum Java of the framework, the build tool version that runs on the target JDK, plugins and annotation processors with JDK limits (Lombok, MapStruct, code generators, Kotlin, Jacoco, Mockito/ByteBuddy). `reference/compatibility.md` lists the usual chain and where to check the current numbers.
 2. **Check what the recipes already cover.** Composite recipes include many steps — `UpgradeSpringBoot_4_0` brings Java to 17 and the Gradle wrapper to 8.14+, but not Java to 25. Read their `recipeList` and mark each prerequisite as "recipe" or "by hand".
 3. **Add the missing recipes to the same run** — one pass with several recipes is the normal case; their internal order is handled by OpenRewrite. Run in separate passes only when a later recipe needs the project to build after an earlier one.
-4. **If a requested target is impossible** (the framework does not support the requested Java yet, a library has no compatible version), say so before migrating instead of finding out halfway.
+4. **Name the exact versions you will land on.** A recipe targets one line (`UpgradeSpringBoot_4_0` → the latest 4.0.x); if a newer line exists without a recipe, say so in the plan and stay on the recipe's line unless the user asked for the newer one.
+5. **If a requested target is impossible** (the framework does not support the requested Java yet, a library has no compatible version), say so before migrating instead of finding out halfway.
 
 Write the plan down in two or three lines — it goes into the report and tells the user what will happen before it happens.
 
@@ -44,7 +45,16 @@ Check that the recipe run really finished (`BUILD SUCCESSFUL` / `BUILD SUCCESS`)
 recipe: Spring Boot 2.7 → 4.0, Java 11 → 25 (OpenRewrite)
 ```
 
-Look through the recipe diff before going on. Recipes sometimes add things a reviewer should know about — explicit versions for dependencies the Spring Boot BOM already manages, compatibility dependencies like old `javax` APIs. Do not "fix" them silently; list them in the report.
+### Clean up after the recipes
+
+Recipes leave noise in the build file. Read the build-file diff and clean it in a separate commit (`llm: clean up after recipes — …`), so the reviewer sees recipe output and cleanup apart:
+
+- **Explicit versions on dependencies the platform BOM manages** (for example `spring-boot-starter-webmvc-test:4.0.8` under the Spring Boot plugin): remove the version so the BOM decides again. Check with `dependencyInsight` (`reference/gradle.md`) or `dependency:tree` that the resolved version is the BOM's afterwards.
+- **Dependencies the code does not need** (a `javax` compatibility API, a servlet API pinned to an older version than the BOM's): remove them only if the build and tests stay green without them; otherwise keep and report.
+- **Plugins, generators and annotation processors the recipes did not upgrade:** if they have a release that supports the target stack natively, raise them to it (newest release that the release notes or the project's GitHub say supports the target) — a native option beats a compatibility switch of an old version. Example: openapi-generator 7.x generates Spring Boot 4 / Jackson 3 code directly, 6.x only knows `useSpringBoot3`.
+- **Build-script deprecations reported by the new Gradle** — the `w: build.gradle.kts:…: '…' is deprecated` lines in the first build after the recipes (commands in `reference/gradle.md`): fix them now — `$buildDir`, `Project.buildDir`, conventions; they turn into errors with the next major.
+
+List every cleanup change in the report with its reason.
 
 ## 4. Build and read the errors
 
@@ -69,8 +79,8 @@ llm: corp-commons 2.0 — util → core package, CorpLogger → CorpLog
 ```
 
 - **Use the real API, not memory.** For a new library version, read its migration notes and the actual signatures (`javap -public -cp <jar> <class>` or the sources jar). New Spring Boot / Spring / Hibernate versions move and rename classes; check before you guess — the framework migration guides on GitHub list most of the moves.
-- **Generated code is fixed at its source.** Errors in generated sources (OpenAPI, protobuf, JAXB, MapStruct output under `build/` or `target/`) are not fixed by editing the generated files — they are overwritten on the next build. Change the generator's configuration (for example the option that switches it from `javax` to `jakarta`) or upgrade the generator plugin, and say so in the report.
-- **Build scripts are code too.** A new Gradle major removes old DSL (`buildDir`, conventions, some task properties); fix the build script with the same care as Java code, and keep values that pin tool versions (like the wrapper task's `gradleVersion`) in sync with what the recipes changed.
+- **Generated code is fixed at its source.** Errors in generated sources (OpenAPI, protobuf, JAXB, MapStruct output under `build/` or `target/`) are not fixed by editing the generated files — they are overwritten on the next build. Prefer a generator version that supports the target stack natively; a compatibility option of the old version (for example the switch from `javax` to `jakarta`) is the fallback. Say which you did in the report.
+- **Build scripts are code too.** Fix the build script with the same care as Java code, and keep values that pin tool versions (like the wrapper task's `gradleVersion`) in sync with what the recipes changed.
 - **Budget:** at most 10 iterations. Stop early if the number of errors has not decreased for two iterations in a row — you are going in circles; report where you are stuck instead of trying random things.
 - **Stay on the task.** Do not refactor, reformat or "improve" code that compiles.
 
@@ -81,7 +91,7 @@ The goal is a migrated project that is as correct as it was before. A green buil
 - Do not delete tests, add `@Disabled` / `@Ignore`, or comment tests out.
 - Do not weaken assertions: no removing `assert`s, no loosening expected values, no catching and swallowing exceptions in tests.
 - Change a test only to adapt it to a changed API (a type or method was renamed, a constructor takes `Duration` instead of `long`) and keep what it checks the same. Mention every such change in the report.
-- Do not change dependency versions by hand, except the target version of the library being migrated. Versions are the recipes' job; a hand-picked version is invisible in the recipe log and easy to get wrong.
+- Do not pick dependency versions by hand. Versions are the recipes' and the BOM's job; a hand-picked version is invisible in the recipe log and easy to get wrong. The exceptions are explicit and each goes into the report: the target version of the library being migrated; removing a version so the BOM manages it again; raising a plugin, generator or annotation processor to a release that supports the target stack (see "Clean up after the recipes").
 - Do not silence problems: no `@SuppressWarnings` to hide removals, no `-Xlint` tweaks, no skipping tests in the build.
 
 If the only way forward breaks one of these rules, stop and ask the user.

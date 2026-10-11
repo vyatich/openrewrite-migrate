@@ -87,6 +87,28 @@ Select-String -Path $log -Pattern ' FAILED$' -Context 0,1 | Select-Object -First
 
 One test class only: `./gradlew test --tests 'demo.shop.order.OrderServiceTest'` — cheaper than the full build while you fix one failing test.
 
+## Cleaning up after the recipes
+
+Which version wins for a dependency, and why (use the configuration where the dependency lives — `runtimeClasspath`, `testRuntimeClasspath`):
+
+```bash
+./gradlew dependencyInsight --dependency spring-boot-starter-webmvc-test --configuration testRuntimeClasspath --console=plain \
+  | grep -E "^[a-z].*:.*:|selected|requested|By constraint|By conflict" | head -15
+```
+
+An explicit version shows up as `requested` next to the module. After removing it, the version should be chosen by the BOM: "selected by rule" with the `io.spring.dependency-management` plugin, "By constraint" with a Gradle `platform(...)`.
+
+Deprecated build DSL that the next Gradle major will remove. The Kotlin DSL reports it while compiling the build script — that happens in the first build after the build file changed (the recipe commit), so look in that build's log:
+
+```bash
+grep -E "^w: .*\.gradle(\.kts)?:[0-9]+:[0-9]+: .*deprecated" "$LOG" | sed -E 's|.*[/\\]||' | sort -u
+# example: build.gradle.kts:49:21: 'var buildDir: File' is deprecated. Deprecated in Java.
+```
+
+Deprecated Gradle features used at run time (plugins, task APIs): `./gradlew help --warning-mode all --console=plain`, then grep the output for `deprecat`.
+
+Typical fix: `"$buildDir/x"` → `layout.buildDirectory.dir("x")` (a `Provider`; plugin properties of type `DirectoryProperty` accept it directly, plain strings need `.get().asFile.path`).
+
 ## Where versions live
 
 When checking that dependency versions were not changed by hand, look at all of them: `build.gradle(.kts)`, `gradle/libs.versions.toml`, `gradle.properties`, `settings.gradle(.kts)` (plugin management).

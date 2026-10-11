@@ -20,7 +20,7 @@ Each of these fails on a JDK newer than it knows, often with misleading errors (
 | --- | --- | --- |
 | Lombok (pinned version) | annotation processing silently does nothing or crashes; getters/constructors "missing" | version that supports the target JDK; `UpgradeToJava25` bumped 1.18.24 → 1.18.48 in our run |
 | MapStruct, other annotation processors | processor errors at compile time | release notes for the target JDK |
-| Code generators (openapi-generator, protobuf, jaxb) | generated code uses `javax`, old APIs | generator options (for example `useSpringBoot3` in openapi-generator's `spring` generator) and plugin version; recipes do not touch generator configuration |
+| Code generators (openapi-generator, protobuf, jaxb) | generated code uses `javax`, old APIs | a plugin version that supports the target natively (openapi-generator 7.x: `useSpringBoot4`, `useJackson3` for Spring Boot 4; 6.x only has `useSpringBoot3`); the generator's release notes on GitHub; recipes touch neither the version nor the configuration |
 | Mockito / ByteBuddy | "Java 25 (69) is not supported" at test time | versions managed by the Spring Boot BOM are fine; pinned ones need a bump |
 | Jacoco | instrumentation fails on new class files | plugin version |
 | Kotlin | compiler does not know the JDK target | Kotlin version required by the framework |
