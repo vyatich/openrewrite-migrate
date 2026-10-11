@@ -1,0 +1,41 @@
+// Applies the OpenRewrite Gradle plugin through an init script, so the project's
+// build files stay untouched. Recipe artifacts come from the same property the
+// Maven plugin uses:
+//
+//   ./gradlew rewriteRun --init-script rewrite-init.gradle \
+//     -Drewrite.activeRecipe=<recipe>,<recipe> \
+//     -Drewrite.recipeArtifactCoordinates=<group:artifact:version>,<group:artifact:version>
+//
+// Plugin 7.39.0 is pinned: 7.40.0 and 7.41.0 depend on a rewrite-bom that is not
+// published to Maven Central.
+
+initscript {
+    repositories {
+        mavenCentral()
+        maven { url = uri("https://plugins.gradle.org/m2") }
+    }
+    dependencies {
+        classpath("org.openrewrite:plugin:7.39.0")
+    }
+}
+
+// -D values from the command line are read from the start parameters: when init
+// scripts are evaluated they are not yet visible through System.getProperty
+def recipeArtifacts = (gradle.startParameter.systemPropertiesArgs["rewrite.recipeArtifactCoordinates"]
+        ?: System.getProperty("rewrite.recipeArtifactCoordinates")
+        ?: "")
+    .split(",")
+    .collect { it.trim() }
+    .findAll { !it.isEmpty() }
+
+rootProject {
+    plugins.apply(org.openrewrite.gradle.RewritePlugin)
+    recipeArtifacts.each { dependencies.add("rewrite", it) }
+    afterEvaluate {
+        if (repositories.isEmpty()) {
+            repositories {
+                mavenCentral()
+            }
+        }
+    }
+}

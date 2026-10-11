@@ -1,0 +1,104 @@
+---
+name: openrewrite-migrate
+description: Migrates a Java project (Maven or Gradle) to new versions of Spring Boot, Java, Jakarta EE or an internal library with breaking changes. OpenRewrite recipes do the bulk of the work; the agent then fixes only the remaining compile and test errors with minimal patches, without weakening tests, and reports what it changed. Use this skill whenever the user asks to upgrade or migrate Spring Boot, the Java version, javax to jakarta, bump a library to a new major version, apply a migration guide, or repair a build broken by such an upgrade — even if OpenRewrite is not mentioned.
+---
+
+# OpenRewrite migration
+
+The migration has two kinds of workers. **Recipes** (OpenRewrite) make the bulk of the changes deterministically and cheaply. **You** fix only the tail the recipes could not handle. The **compiler and the tests** decide whether the result is right, not you and not the user's hopes. Keep that split: every change you make by hand costs review time and can be wrong, every change a recipe makes is reproducible.
+
+Work through the steps in order. Commit after each step so any step can be rolled back and the reviewer can see who did what.
+
+## 1. Look before you touch
+
+Find out, without changing anything:
+
+- **Build tool and wrapper.** `pom.xml` → Maven, `build.gradle(.kts)` / `settings.gradle(.kts)` → Gradle. Use the project's wrapper (`gradlew`, `mvnw`) if there is one; otherwise the tool from PATH. A system Gradle that is much newer than the project usually cannot build it — see `reference/gradle.md`.
+- **Current versions:** Spring Boot (plugin or parent), Java (toolchain, `release`, `java.version`), internal libraries and their target versions.
+- **Which JDK runs the build today.** An old Gradle refuses to start on a new JDK (Gradle 6.8 runs on JDK ≤ 15). Pick `JAVA_HOME` by the wrapper version — table in `reference/gradle.md`.
+- **Migration notes of internal libraries:** `MIGRATION.md`, `CHANGELOG.md`, release notes next to the library sources or in its sources jar. Public recipes know nothing about internal libraries; these notes are your main source there.
+- **Git state.** The working tree must be clean — otherwise your changes mix with the user's. Work on a new branch.
+
+Then run the full build with tests **before** migrating and write down the result (green or not, number of tests). If the baseline is already red, stop and tell the user: on a red baseline you cannot tell migration errors from old ones.
+
+## 2. Run the recipes
+
+Pick recipes from `reference/recipe-catalog.md`. Run them **without editing the build file** — through the Maven plugin coordinates or a Gradle init script (`reference/maven.md`, `reference/gradle.md`). Use the pinned versions from the catalog: the newest OpenRewrite release is sometimes not resolvable yet.
+
+Internal library bump: change its version in the build file yourself — this is the one dependency version you are allowed to touch by hand, because no public recipe knows it.
+
+Check that the recipe run really finished (`BUILD SUCCESSFUL` / `BUILD SUCCESS`). A run that died halfway (for example out of memory) can leave the project half-migrated. Then commit:
+
+```
+recipe: Spring Boot 2.7 → 4.0, Java 11 → 25 (OpenRewrite)
+```
+
+Look through the recipe diff before going on. Recipes sometimes add things a reviewer should know about — explicit versions for dependencies the Spring Boot BOM already manages, compatibility dependencies like old `javax` APIs. Do not "fix" them silently; list them in the report.
+
+## 3. Build and read the errors
+
+Build with tests on the **target** JDK. Do not read the whole log — it is hundreds of lines for a handful of errors. Extract what matters:
+
+- compile errors: lines with `error:` — file, line, message;
+- failed tests: test reports (`build/test-results/test/*.xml` for Gradle, `target/surefire-reports/*.xml` for Maven) — test name and the first lines of the failure.
+
+Group errors by cause. One missing package usually produces a dozen "cannot find symbol" errors; fix the cause, not every line.
+
+javac reports errors in waves: while a package is missing it does not look deeper. Expect new errors after each fix — that is progress, not a regression, as long as the old ones are gone.
+
+## 4. Fix the tail in a loop
+
+Each iteration: pick a group of errors → make the **minimal** change → build again → commit:
+
+```
+llm: corp-commons 2.0 — util → core package, CorpLogger → CorpLog
+```
+
+- **Use the real API, not memory.** For a new library version, read its migration notes and the actual signatures (`javap -public -cp <jar> <class>` or the sources jar). New Spring Boot / Spring / Hibernate versions move and rename classes; check before you guess.
+- **Budget:** at most 10 iterations. Stop early if the number of errors has not decreased for two iterations in a row — you are going in circles; report where you are stuck instead of trying random things.
+- **Stay on the task.** Do not refactor, reformat or "improve" code that compiles.
+
+### What you must not do, and why
+
+The goal is a migrated project that is as correct as it was before. A green build obtained by weakening the checks is worse than a red build, because it hides the breakage.
+
+- Do not delete tests, add `@Disabled` / `@Ignore`, or comment tests out.
+- Do not weaken assertions: no removing `assert`s, no loosening expected values, no catching and swallowing exceptions in tests.
+- Change a test only to adapt it to a changed API (a type or method was renamed, a constructor takes `Duration` instead of `long`) and keep what it checks the same. Mention every such change in the report.
+- Do not change dependency versions by hand, except the target version of the library being migrated. Versions are the recipes' job; a hand-picked version is invisible in the recipe log and easy to get wrong.
+- Do not silence problems: no `@SuppressWarnings` to hide removals, no `-Xlint` tweaks, no skipping tests in the build.
+
+If the only way forward breaks one of these rules, stop and ask the user.
+
+## 5. Turn repeated fixes into a recipe
+
+If you made the same kind of fix three or more times (the same package rename, type rename, method rename), propose a declarative recipe in `rewrite.yml` at the project root, so the next service with the same library is migrated without you. How to write and check it: `reference/recipe-authoring.md`.
+
+A fix that is not a pure rename (for example `long` milliseconds → `Duration`) does not fit a declarative recipe. Do not write a complex recipe yourself; put two or three before/after examples into the report — they are a ready task for whoever writes the recipe.
+
+## 6. Report
+
+Finish with a report for the reviewer:
+
+```
+## Migration report
+
+**Result:** build green / red, tests N passed of M (baseline: M)
+**Versions:** Spring Boot A → B, Java X → Y, <library> P → Q, Gradle/Maven wrapper R → S
+
+### Done by recipes
+- <recipe> — <what it changed, in one line>
+
+### Fixed by hand (commits `llm:`)
+- <file>: <what and why>
+
+### Tests changed to follow an API change
+- <test>: <old call> → <new call>; the check itself is unchanged
+
+### For the reviewer
+- <things recipes added that deserve a look: explicit versions, compatibility dependencies>
+- <anything left unfinished and why>
+
+### Recipe candidates
+- <proposed rewrite.yml recipe, or before/after examples for a non-declarative change>
+```
