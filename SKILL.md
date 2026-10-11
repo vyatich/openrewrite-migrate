@@ -23,7 +23,7 @@ Then run the full build with tests **before** migrating and write down the resul
 
 ## 2. Run the recipes
 
-Pick recipes from `reference/recipe-catalog.md`. Run them **without editing the build file** — through the Maven plugin coordinates or a Gradle init script (`reference/maven.md`, `reference/gradle.md`). Use the pinned versions from the catalog: the newest OpenRewrite release is sometimes not resolvable yet.
+Find the recipes and their current versions — `reference/recipe-catalog.md` says where to look (OpenRewrite docs, the recipe YAML on GitHub, Maven Central) and lists the last versions that worked, as a fallback. Read the `recipeList` of the recipe you pick: it tells you what the recipes will do and therefore what is left for you. Run them **without editing the build file** — through the Maven plugin coordinates or a Gradle init script (`reference/maven.md`, `reference/gradle.md`).
 
 Internal library bump: change its version in the build file yourself — this is the one dependency version you are allowed to touch by hand, because no public recipe knows it.
 
@@ -54,7 +54,9 @@ Each iteration: pick a group of errors → make the **minimal** change → build
 llm: corp-commons 2.0 — util → core package, CorpLogger → CorpLog
 ```
 
-- **Use the real API, not memory.** For a new library version, read its migration notes and the actual signatures (`javap -public -cp <jar> <class>` or the sources jar). New Spring Boot / Spring / Hibernate versions move and rename classes; check before you guess.
+- **Use the real API, not memory.** For a new library version, read its migration notes and the actual signatures (`javap -public -cp <jar> <class>` or the sources jar). New Spring Boot / Spring / Hibernate versions move and rename classes; check before you guess — the framework migration guides on GitHub list most of the moves.
+- **Generated code is fixed at its source.** Errors in generated sources (OpenAPI, protobuf, JAXB, MapStruct output under `build/` or `target/`) are not fixed by editing the generated files — they are overwritten on the next build. Change the generator's configuration (for example the option that switches it from `javax` to `jakarta`) or upgrade the generator plugin, and say so in the report.
+- **Build scripts are code too.** A new Gradle major removes old DSL (`buildDir`, conventions, some task properties); fix the build script with the same care as Java code, and keep values that pin tool versions (like the wrapper task's `gradleVersion`) in sync with what the recipes changed.
 - **Budget:** at most 10 iterations. Stop early if the number of errors has not decreased for two iterations in a row — you are going in circles; report where you are stuck instead of trying random things.
 - **Stay on the task.** Do not refactor, reformat or "improve" code that compiles.
 

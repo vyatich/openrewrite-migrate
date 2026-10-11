@@ -32,9 +32,11 @@ Order matters: after `ChangePackage` the old class lives in the new package, so 
 
 ## How to check it
 
-1. Go back to the state before your hand fixes (a separate branch from the recipe commit).
-2. Run only this recipe with a dry run (`rewriteDryRun` / `rewrite-maven-plugin:dryRun`, `-Drewrite.activeRecipe(s)=com.corp.MigrateCorpCommons_2_0`) and compare the patch with your hand fixes.
+1. Check it on the **pre-migration** commit, in a scratch worktree or branch: the OpenRewrite plugins compile the sources before running recipes, and the pre-migration code still compiles on its old JDK, while the bare recipe commit usually does not.
+2. Run only this recipe with a dry run (`rewriteDryRun` / `rewrite-maven-plugin:dryRun`, `-Drewrite.activeRecipe(s)=com.corp.MigrateCorpCommons_2_0`) and compare the patch with your hand fixes for that library.
 3. If it reproduces them, the recipe is good; put it into the report as a proposal. The user decides whether it goes into the shared recipe catalog.
+
+One dry run is enough. If it does not match on the first try, put the recipe into the report as a draft instead of iterating on it — the migration itself is the job.
 
 ## When it does not fit
 
