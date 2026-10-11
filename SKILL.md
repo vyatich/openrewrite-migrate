@@ -21,9 +21,20 @@ Find out, without changing anything:
 
 Then run the full build with tests **before** migrating and write down the result (green or not, number of tests). If the baseline is already red, stop and tell the user: on a red baseline you cannot tell migration errors from old ones.
 
-## 2. Run the recipes
+## 2. Plan the upgrade path
 
-Find the recipes and their current versions — `reference/recipe-catalog.md` says where to look (OpenRewrite docs, the recipe YAML on GitHub, Maven Central) and lists the last versions that worked, as a fallback. Read the `recipeList` of the recipe you pick: it tells you what the recipes will do and therefore what is left for you. Run them **without editing the build file** — through the Maven plugin coordinates or a Gradle init script (`reference/maven.md`, `reference/gradle.md`).
+A target version drags its prerequisites along, and the user rarely names them. "Spring Boot 4" means at least Java 17; "Java 25" means a Gradle that can run on JDK 25 and annotation processors and plugins that understand Java 25 class files. Work the chain out before running anything:
+
+1. **From the targets, derive the prerequisites** — minimum and maximum Java of the framework, the build tool version that runs on the target JDK, plugins and annotation processors with JDK limits (Lombok, MapStruct, code generators, Kotlin, Jacoco, Mockito/ByteBuddy). `reference/compatibility.md` lists the usual chain and where to check the current numbers.
+2. **Check what the recipes already cover.** Composite recipes include many steps — `UpgradeSpringBoot_4_0` brings Java to 17 and the Gradle wrapper to 8.14+, but not Java to 25. Read their `recipeList` and mark each prerequisite as "recipe" or "by hand".
+3. **Add the missing recipes to the same run** — one pass with several recipes is the normal case; their internal order is handled by OpenRewrite. Run in separate passes only when a later recipe needs the project to build after an earlier one.
+4. **If a requested target is impossible** (the framework does not support the requested Java yet, a library has no compatible version), say so before migrating instead of finding out halfway.
+
+Write the plan down in two or three lines — it goes into the report and tells the user what will happen before it happens.
+
+## 3. Run the recipes
+
+Find the recipes and their current versions — `reference/recipe-catalog.md` says where to look (OpenRewrite docs, the recipe YAML on GitHub, Maven Central) and lists the last versions that worked, as a fallback. Run them **without editing the build file** — through the Maven plugin coordinates or a Gradle init script (`reference/maven.md`, `reference/gradle.md`).
 
 Internal library bump: change its version in the build file yourself — this is the one dependency version you are allowed to touch by hand, because no public recipe knows it.
 
@@ -35,18 +46,21 @@ recipe: Spring Boot 2.7 → 4.0, Java 11 → 25 (OpenRewrite)
 
 Look through the recipe diff before going on. Recipes sometimes add things a reviewer should know about — explicit versions for dependencies the Spring Boot BOM already manages, compatibility dependencies like old `javax` APIs. Do not "fix" them silently; list them in the report.
 
-## 3. Build and read the errors
+## 4. Build and read the errors
 
-Build with tests on the **target** JDK. Do not read the whole log — it is hundreds of lines for a handful of errors. Extract what matters:
+Build with tests on the **target** JDK. Never let the build output into your context — a failed build is hundreds of lines (one migration produced 1,100 lines for two errors), and a test report carries full stack traces. Send the output to a log file outside the repository and pull out only what you need with the commands in `reference/gradle.md` / `reference/maven.md`:
 
-- compile errors: lines with `error:` — file, line, message;
-- failed tests: test reports (`build/test-results/test/*.xml` for Gradle, `target/surefire-reports/*.xml` for Maven) — test name and the first lines of the failure.
+- the build verdict and the first lines of "What went wrong";
+- compile errors grouped by message and by file — the counts tell you the causes;
+- names of failed tests and the first lines of each failure, without stack traces.
 
-Group errors by cause. One missing package usually produces a dozen "cannot find symbol" errors; fix the cause, not every line.
+Open more of the log only for one specific error you cannot understand from those lines, and only around it.
+
+Group errors by cause. One missing package usually produces a dozen "cannot find symbol" errors; fix the cause, not every line. javac stops at 100 errors — a count of exactly 100 means there are more behind them.
 
 javac reports errors in waves: while a package is missing it does not look deeper. Expect new errors after each fix — that is progress, not a regression, as long as the old ones are gone.
 
-## 4. Fix the tail in a loop
+## 5. Fix the tail in a loop
 
 Each iteration: pick a group of errors → make the **minimal** change → build again → commit:
 
@@ -72,13 +86,13 @@ The goal is a migrated project that is as correct as it was before. A green buil
 
 If the only way forward breaks one of these rules, stop and ask the user.
 
-## 5. Turn repeated fixes into a recipe
+## 6. Turn repeated fixes into a recipe
 
 If you made the same kind of fix three or more times (the same package rename, type rename, method rename), propose a declarative recipe in `rewrite.yml` at the project root, so the next service with the same library is migrated without you. How to write and check it: `reference/recipe-authoring.md`.
 
 A fix that is not a pure rename (for example `long` milliseconds → `Duration`) does not fit a declarative recipe. Do not write a complex recipe yourself; put two or three before/after examples into the report — they are a ready task for whoever writes the recipe.
 
-## 6. Report
+## 7. Report
 
 Finish with a report for the reviewer:
 
@@ -87,6 +101,9 @@ Finish with a report for the reviewer:
 
 **Result:** build green / red, tests N passed of M (baseline: M)
 **Versions:** Spring Boot A → B, Java X → Y, <library> P → Q, Gradle/Maven wrapper R → S
+
+### Upgrade plan
+- <target> → requires <prerequisite> — covered by <recipe> / done by hand
 
 ### Done by recipes
 - <recipe> — <what it changed, in one line>

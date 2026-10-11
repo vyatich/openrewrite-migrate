@@ -16,11 +16,27 @@ Maven 3.9 runs on any JDK from 8 to 25, so run it on the target JDK. If the proj
 
 ## Build and errors
 
-```
-./mvnw -B verify
+Send the output to a file outside the repository and read only extracts (checked on a real log: 1,102 lines → the verdict and two errors):
+
+```bash
+LOG="${TMPDIR:-/tmp}/migrate-build.log"
+./mvnw -B verify > "$LOG" 2>&1; echo "exit=$?"
+
+# 1. Verdict
+grep -E "^\[INFO\] BUILD (SUCCESS|FAILURE)" "$LOG"
+
+# 2. Compile errors (Maven prints them twice — sort -u), where, by message, by missing symbol
+grep -E "^\[ERROR\] .*\.java:\[[0-9]+,[0-9]+\]" "$LOG" | sort -u > "${TMPDIR:-/tmp}/migrate-errors.log"
+wc -l < "${TMPDIR:-/tmp}/migrate-errors.log"
+awk '/[\\\/](build|target)[\\\/]generated/{g++; next} /[\\\/]src[\\\/]test/{t++; next} {m++} END{print "generated", g+0, "| main", m+0, "| test", t+0}' "${TMPDIR:-/tmp}/migrate-errors.log"
+grep -oE "error: .*" "${TMPDIR:-/tmp}/migrate-errors.log" | sort | uniq -c | sort -rn | head -15
+grep -A2 "cannot find symbol" "$LOG" | grep -oE "symbol: +.*" | tr -s ' ' | sort | uniq -c | sort -rn | head -15
+
+# 3. Failed tests: summary lines and the first line of each failure
+grep -E "Tests run:.*(Failures: [1-9]|Errors: [1-9])|<<< (FAILURE|ERROR)!" "$LOG" | head -20
 ```
 
-- Compile errors: lines `[ERROR] <file>.java:[line,col] error: ...`.
-- Test results: `target/surefire-reports/TEST-*.xml`.
+How to read the extracts: see the same section in `gradle.md`.
+
 - One test class only: `-Dtest=OrderServiceTest`.
 - Versions to watch: `pom.xml` (dependencies, `dependencyManagement`, properties, parent).

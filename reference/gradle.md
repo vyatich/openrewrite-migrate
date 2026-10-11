@@ -38,14 +38,54 @@ No wrapper in the project? A system Gradle several majors newer than the project
 
 ## Build and errors
 
-```
-./gradlew build --no-daemon --console=plain
+After the recipes the wrapper is new (for example 9.1) — run it on the target JDK. Send the output to a file outside the repository and read only extracts of it. Commands for Git Bash / any POSIX shell (checked on real logs: 1,100 lines of output reduce to about 20):
+
+```bash
+LOG="${TMPDIR:-/tmp}/migrate-build.log"
+./gradlew build --no-daemon --console=plain > "$LOG" 2>&1; echo "exit=$?"
+
+# 1. Verdict and the reason
+grep -E "^BUILD (SUCCESSFUL|FAILED)" "$LOG"
+grep -A4 "^\* What went wrong" "$LOG" | head -6
+
+# Gradle prints compiler output twice; keep only the first copy
+ERRS="${TMPDIR:-/tmp}/migrate-errors.log"
+sed '/^\* What went wrong/,$d' "$LOG" > "$ERRS"
+
+# 2. Compile errors: total (javac stops at 100), where, by message, by missing symbol
+grep -E "^[0-9]+ errors?$" "$ERRS"
+grep ": error:" "$ERRS" | awk '/[\\\/](build|target)[\\\/]generated/{g++; next} /[\\\/]src[\\\/]test/{t++; next} {m++} END{print "generated", g+0, "| main", m+0, "| test", t+0}'
+grep -oE "error: .*" "$ERRS" | sort | uniq -c | sort -rn | head -15
+grep -A3 ": error: cannot find symbol" "$ERRS" | grep -oE "symbol: +.*" | tr -s ' ' | sort | uniq -c | sort -rn | head -15
+
+# 3. One concrete error with its source line, when you need it
+grep -A3 ": error:" "$ERRS" | grep -A3 "DeliveryClient.java" | head -8
+
+# 4. Failed tests: names and the first line of each failure, no stack traces
+grep -A1 -E " FAILED$" "$LOG" | grep -vE "^--$|Task :" | head -30
+grep -ohE 'tests="[0-9]+"|failures="[0-9]+"|errors="[0-9]+"|skipped="[0-9]+"' build/test-results/test/TEST-*.xml \
+  | awk -F'"' '{s[$1]+=$2} END{for (k in s) printf "%s%d ", k, s[k]; print ""}'
 ```
 
-- After the recipes the wrapper is new (for example 9.1) — run it on the target JDK.
-- Compile errors: lines containing `error:`.
-- Test results: `build/test-results/test/TEST-*.xml` (JUnit XML: `<testcase>` with `<failure>` or `<error>`).
-- One test class only: `./gradlew test --tests 'demo.shop.order.OrderServiceTest'`.
+Reading the extracts:
+
+- **Most errors in `generated`** — the cause is the generator configuration or version, not the code (see "Generated code is fixed at its source" in SKILL.md).
+- **"package X does not exist" + "cannot find symbol: class Y"** for one library — a package or type was renamed; the library's migration notes or `javap` on the new jar tell you the new name.
+- **Exactly 100 errors** — javac stopped counting; expect another wave after the first fix.
+
+PowerShell equivalents, if there is no POSIX shell:
+
+```powershell
+$log = "$env:TEMP\migrate-build.log"
+.\gradlew.bat build --no-daemon --console=plain *> $log
+Select-String -Path $log -Pattern '^BUILD (SUCCESSFUL|FAILED)'
+$cut = (Select-String -Path $log -Pattern '^\* What went wrong' | Select-Object -First 1).LineNumber
+$errs = if ($cut) { Get-Content $log -TotalCount ($cut - 1) } else { Get-Content $log }
+$errs | Select-String ': error: (.*)' | ForEach-Object { $_.Matches[0].Groups[1].Value } | Group-Object | Sort-Object Count -Descending | Select-Object -First 15 Count, Name
+Select-String -Path $log -Pattern ' FAILED$' -Context 0,1 | Select-Object -First 30
+```
+
+One test class only: `./gradlew test --tests 'demo.shop.order.OrderServiceTest'` — cheaper than the full build while you fix one failing test.
 
 ## Where versions live
 
