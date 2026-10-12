@@ -33,4 +33,19 @@ Moderne Source Available: free to use on your own code, not to resell as a servi
 
 ## Internal libraries
 
-There are no public recipes for internal libraries. Read the library's `MIGRATION.md` / changelog; for pure renames the generic recipes from `rewrite-java` work without extra artifacts (`ChangePackage`, `ChangeType`, `ChangeMethodName`, plus `org.openrewrite.gradle.UpgradeDependencyVersion` / `org.openrewrite.maven.UpgradeDependencyVersion`) — they take parameters, so they go into a `rewrite.yml`, see `recipe-authoring.md`.
+There are no public recipes for internal libraries, but there may be internal ones: the library's team publishes a recipe artifact with each breaking release (often `<group>:<library>-recipes:<version>`), once for every team. Where to find it:
+
+1. The library's migration notes (`MIGRATION.md`, changelog, release notes) — they name the recipe and its artifact.
+2. The organisation's catalog: `internal-recipes.md` next to this file.
+3. The company's artifact server: an artifact with `recipes` in its name next to the library.
+
+What an artifact contains — the recipe names and what each one covers — is in the YAML files under `META-INF/rewrite/` inside the jar:
+
+```bash
+unzip -l <jar> | grep META-INF/rewrite/
+unzip -p <jar> 'META-INF/rewrite/*.yml' | grep -E "^name:|^displayName:|^description:|^  [^ -]|^  - "
+```
+
+Read the recipe's description: it usually says which changes it does **not** cover — those stay for you.
+
+No recipe for an internal library: fix by hand following its migration notes, and report the repeated fixes as recipe candidates (SKILL.md, step 6).

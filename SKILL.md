@@ -16,7 +16,7 @@ Find out, without changing anything:
 - **Build tool and wrapper.** `pom.xml` → Maven, `build.gradle(.kts)` / `settings.gradle(.kts)` → Gradle. Use the project's wrapper (`gradlew`, `mvnw`) if there is one; otherwise the tool from PATH. A system Gradle that is much newer than the project usually cannot build it — see `reference/gradle.md`.
 - **Current versions:** Spring Boot (plugin or parent), Java (toolchain, `release`, `java.version`), internal libraries and their target versions.
 - **Which JDK runs the build today.** An old Gradle refuses to start on a new JDK (Gradle 6.8 runs on JDK ≤ 15). Pick `JAVA_HOME` by the wrapper version — table in `reference/gradle.md`.
-- **Migration notes of internal libraries:** `MIGRATION.md`, `CHANGELOG.md`, release notes next to the library sources or in its sources jar. Public recipes know nothing about internal libraries; these notes are your main source there.
+- **Migration notes of internal libraries:** `MIGRATION.md`, `CHANGELOG.md`, release notes next to the library sources or in its sources jar. Public recipes know nothing about internal libraries; these notes are your main source there — and they usually name the recipe the library team published for the upgrade.
 - **Git state.** The working tree must be clean — otherwise your changes mix with the user's. Work on a new branch.
 
 Then run the full build with tests **before** migrating and write down the result (green or not, number of tests). If the baseline is already red, stop and tell the user: on a red baseline you cannot tell migration errors from old ones.
@@ -27,9 +27,10 @@ A target version drags its prerequisites along, and the user rarely names them. 
 
 1. **From the targets, derive the prerequisites** — minimum and maximum Java of the framework, the build tool version that runs on the target JDK, plugins and annotation processors with JDK limits (Lombok, MapStruct, code generators, Kotlin, Jacoco, Mockito/ByteBuddy). `reference/compatibility.md` lists the usual chain and where to check the current numbers.
 2. **Check what the recipes already cover.** Composite recipes include many steps — `UpgradeSpringBoot_4_0` brings Java to 17 and the Gradle wrapper to 8.14+, but not Java to 25. Read their `recipeList` and mark each prerequisite as "recipe" or "by hand".
-3. **Add the missing recipes to the same run** — one pass with several recipes is the normal case; their internal order is handled by OpenRewrite. Run in separate passes only when a later recipe needs the project to build after an earlier one.
-4. **Name the exact versions you will land on.** A recipe targets one line (`UpgradeSpringBoot_4_0` → the latest 4.0.x); if a newer line exists without a recipe, say so in the plan and stay on the recipe's line unless the user asked for the newer one.
-5. **If a requested target is impossible** (the framework does not support the requested Java yet, a library has no compatible version), say so before migrating instead of finding out halfway.
+3. **Find the internal recipes.** Library teams publish a migration recipe with each breaking release, once for every team that uses the library — you connect it, you do not write it. Look in the library's migration notes and in the organisation's recipe catalog (`reference/internal-recipes.md`); `reference/recipe-catalog.md` says how to check an artifact's contents.
+4. **Add all the recipes to the same run** — public and internal; one pass with several recipes is the normal case, their internal order is handled by OpenRewrite. Run in separate passes only when a later recipe needs the project to build after an earlier one.
+5. **Name the exact versions you will land on.** A recipe targets one line (`UpgradeSpringBoot_4_0` → the latest 4.0.x); if a newer line exists without a recipe, say so in the plan and stay on the recipe's line unless the user asked for the newer one.
+6. **If a requested target is impossible** (the framework does not support the requested Java yet, a library has no compatible version), say so before migrating instead of finding out halfway.
 
 Write the plan down in two or three lines — it goes into the report and tells the user what will happen before it happens.
 
@@ -37,7 +38,7 @@ Write the plan down in two or three lines — it goes into the report and tells 
 
 Find the recipes and their current versions — `reference/recipe-catalog.md` says where to look (OpenRewrite docs, the recipe YAML on GitHub, Maven Central) and lists the last versions that worked, as a fallback. Run them **without editing the build file** — through the Maven plugin coordinates or a Gradle init script (`reference/maven.md`, `reference/gradle.md`).
 
-Internal library bump: change its version in the build file yourself — this is the one dependency version you are allowed to touch by hand, because no public recipe knows it.
+Internal recipe artifacts go into the same run, next to the public ones (`-Drewrite.recipeArtifactCoordinates=…,<group>:<library>-recipes:<version>`); they resolve from the project's own repositories, where the company's artifact server already is. An internal library without a recipe: change its version in the build file yourself — the one dependency version you are allowed to touch by hand.
 
 Check that the recipe run really finished (`BUILD SUCCESSFUL` / `BUILD SUCCESS`). A run that died halfway (for example out of memory) can leave the project half-migrated. Then commit:
 
@@ -75,7 +76,7 @@ javac reports errors in waves: while a package is missing it does not look deepe
 Each iteration: pick a group of errors → make the **minimal** change → build again → commit:
 
 ```
-llm: corp-commons 2.0 — util → core package, CorpLogger → CorpLog
+llm: Spring Framework 7 — ListenableFuture → CompletableFuture in NotificationSender
 ```
 
 - **Use the real API, not memory.** For a new library version, read its migration notes and the actual signatures (`javap -public -cp <jar> <class>` or the sources jar). New Spring Boot / Spring / Hibernate versions move and rename classes; check before you guess — the framework migration guides on GitHub list most of the moves.
@@ -96,11 +97,11 @@ The goal is a migrated project that is as correct as it was before. A green buil
 
 If the only way forward breaks one of these rules, stop and ask the user.
 
-## 6. Turn repeated fixes into a recipe
+## 6. Report recipe candidates
 
-If you made the same kind of fix three or more times (the same package rename, type rename, method rename), propose a declarative recipe in `rewrite.yml` at the project root, so the next service with the same library is migrated without you. How to write and check it: `reference/recipe-authoring.md`.
+Writing recipes is not part of a migration. A recipe is written once, by the library's team, tested and published for every service — not packed into each service separately (that is the job of the `openrewrite-recipe-author` skill).
 
-A fix that is not a pure rename (for example `long` milliseconds → `Duration`) does not fit a declarative recipe. Do not write a complex recipe yourself; put two or three before/after examples into the report — they are a ready task for whoever writes the recipe.
+What you do: if you made the same kind of fix three or more times for a library and no recipe covered it, put two or three before/after examples into the report under "Recipe candidates", with the library name and version. That is a ready task for the recipe authors; the next service then gets the fix from the recipe instead of from you.
 
 ## 7. Report
 
@@ -129,5 +130,5 @@ Finish with a report for the reviewer:
 - <anything left unfinished and why>
 
 ### Recipe candidates
-- <proposed rewrite.yml recipe, or before/after examples for a non-declarative change>
+- <library> <version>: <kind of change>, seen N times — before: `<code>` → after: `<code>`
 ```
