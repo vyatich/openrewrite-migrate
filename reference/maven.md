@@ -1,5 +1,7 @@
 # Maven projects
 
+> The scripts in `scripts/` (`BuildReport.java`, `RunRecipes.java`) do all of this in one call each. Read this file only if a script cannot run, or to understand what it does.
+
 ## Run recipes without editing the pom
 
 ```

@@ -5,130 +5,89 @@ description: Migrates a Java project (Maven or Gradle) to new versions of Spring
 
 # OpenRewrite migration
 
-The migration has two kinds of workers. **Recipes** (OpenRewrite) make the bulk of the changes deterministically and cheaply. **You** fix only the tail the recipes could not handle. The **compiler and the tests** decide whether the result is right, not you and not the user's hopes. Keep that split: every change you make by hand costs review time and can be wrong, every change a recipe makes is reproducible.
+**Recipes** (OpenRewrite) make the bulk of the changes — deterministic, cheap, reproducible. **You** fix only the tail they leave. The **compiler and the tests** decide whether the result is right. Every line you write by hand costs review time; every line a recipe writes does not.
 
-Work through the steps in order. Commit after each step so any step can be rolled back and the reviewer can see who did what.
+Three scripts in `scripts/` do the mechanical work in one call each and answer with short JSON — use them instead of running the build tool yourself and reading its log (a failed build is hundreds of lines; the JSON is a few dozen):
 
-## 1. Look before you touch
+| Script | Does |
+| --- | --- |
+| `java <skill>/scripts/BuildReport.java --project <dir> [--task compile\|build\|test] [--tests P]` | builds; verdict, compile errors grouped by cause, failed tests without stack traces, build-script deprecations |
+| `java <skill>/scripts/RunRecipes.java --project <dir> --recipes R1,R2 [--artifacts g:a:v,…] [--commit "…"] [--dry-run]` | runs recipes without editing the build, checks the run finished, lists changed files and cleanup hints, commits |
+| `java <skill>/scripts/CheckDiff.java --install-hook` | installs a pre-commit hook that refuses commits weakening tests |
 
-Find out, without changing anything:
+They need JDK 17+ to start, detect Maven or Gradle and the wrapper themselves, and run Gradle on the newest installed JDK its version supports (an old wrapper cannot start on a new JDK). Override with `--java-home`.
 
-- **Build tool and wrapper.** `pom.xml` → Maven, `build.gradle(.kts)` / `settings.gradle(.kts)` → Gradle. Use the project's wrapper (`gradlew`, `mvnw`) if there is one; otherwise the tool from PATH. A system Gradle that is much newer than the project usually cannot build it — see `reference/gradle.md`.
-- **Current versions:** Spring Boot (plugin or parent), Java (toolchain, `release`, `java.version`), internal libraries and their target versions.
-- **Which JDK runs the build today.** An old Gradle refuses to start on a new JDK (Gradle 6.8 runs on JDK ≤ 15). Pick `JAVA_HOME` by the wrapper version — table in `reference/gradle.md`.
-- **Migration notes of internal libraries:** `MIGRATION.md`, `CHANGELOG.md`, release notes next to the library sources or in its sources jar. Public recipes know nothing about internal libraries; these notes are your main source there — and they usually name the recipe the library team published for the upgrade.
-- **Git state.** The working tree must be clean — otherwise your changes mix with the user's. Work on a new branch.
+## 1. Baseline
 
-Then run the full build with tests **before** migrating and write down the result (green or not, number of tests). If the baseline is already red, stop and tell the user: on a red baseline you cannot tell migration errors from old ones.
+1. The working tree must be clean; create a branch. Install the guard: `CheckDiff.java --install-hook`.
+2. `BuildReport.java --project <dir>` — the build must be green before you change anything; note the test count. If it is red, stop and tell the user: on a red baseline migration errors cannot be told from old ones.
+3. Read the build file for current versions, and the migration notes (`MIGRATION.md`, changelog) of every internal library you upgrade — they say what breaks and name the recipe the library team published.
 
-## 2. Plan the upgrade path
+## 2. Plan — two to four lines, before anything runs
 
-A target version drags its prerequisites along, and the user rarely names them. "Spring Boot 4" means at least Java 17; "Java 25" means a Gradle that can run on JDK 25 and annotation processors and plugins that understand Java 25 class files. Work the chain out before running anything:
+- **Prerequisites of the targets.** Spring Boot 4 needs Java 17+; Java 25 needs a Gradle that runs on it; annotation processors, code generators and bytecode tools need versions that know the target. Read `reference/compatibility.md` only if the project uses a tool you are not sure about.
+- **Recipes that cover them.** `UpgradeSpringBoot_4_0` brings Java to 17 and the Gradle wrapper along, but not Java to 25 — add `UpgradeToJava25`. Recipe names and the versions that work: `reference/recipe-catalog.md`. Look versions up online only if those fail or the user asked for the newest.
+- **Internal recipes.** From the library's migration notes or `reference/internal-recipes.md`. Connect them, never write them.
+- **Exact landing versions.** A recipe targets one line (4.0.x); if a newer line exists without a recipe, say so and stay on the recipe's line unless the user asked otherwise.
+- If a target is impossible, say so now.
 
-1. **From the targets, derive the prerequisites** — minimum and maximum Java of the framework, the build tool version that runs on the target JDK, plugins and annotation processors with JDK limits (Lombok, MapStruct, code generators, Kotlin, Jacoco, Mockito/ByteBuddy). `reference/compatibility.md` lists the usual chain and where to check the current numbers.
-2. **Check what the recipes already cover.** Composite recipes include many steps — `UpgradeSpringBoot_4_0` brings Java to 17 and the Gradle wrapper to 8.14+, but not Java to 25. Read their `recipeList` and mark each prerequisite as "recipe" or "by hand".
-3. **Find the internal recipes.** Library teams publish a migration recipe with each breaking release, once for every team that uses the library — you connect it, you do not write it. Look in the library's migration notes and in the organisation's recipe catalog (`reference/internal-recipes.md`); `reference/recipe-catalog.md` says how to check an artifact's contents.
-4. **Add all the recipes to the same run** — public and internal; one pass with several recipes is the normal case, their internal order is handled by OpenRewrite. Run in separate passes only when a later recipe needs the project to build after an earlier one.
-5. **Name the exact versions you will land on.** A recipe targets one line (`UpgradeSpringBoot_4_0` → the latest 4.0.x); if a newer line exists without a recipe, say so in the plan and stay on the recipe's line unless the user asked for the newer one.
-6. **If a requested target is impossible** (the framework does not support the requested Java yet, a library has no compatible version), say so before migrating instead of finding out halfway.
-
-Write the plan down in two or three lines — it goes into the report and tells the user what will happen before it happens.
-
-## 3. Run the recipes
-
-Find the recipes and their current versions — `reference/recipe-catalog.md` says where to look (OpenRewrite docs, the recipe YAML on GitHub, Maven Central) and lists the last versions that worked, as a fallback. Run them **without editing the build file** — through the Maven plugin coordinates or a Gradle init script (`reference/maven.md`, `reference/gradle.md`).
-
-Internal recipe artifacts go into the same run, next to the public ones (`-Drewrite.recipeArtifactCoordinates=…,<group>:<library>-recipes:<version>`); they resolve from the project's own repositories, where the company's artifact server already is. An internal library without a recipe: change its version in the build file yourself — the one dependency version you are allowed to touch by hand.
-
-Check that the recipe run really finished (`BUILD SUCCESSFUL` / `BUILD SUCCESS`). A run that died halfway (for example out of memory) can leave the project half-migrated. Then commit:
+## 3. Recipes — one run, one commit
 
 ```
-recipe: Spring Boot 2.7 → 4.0, Java 11 → 25 (OpenRewrite)
+RunRecipes.java --project <dir> --recipes <public and internal recipes> --artifacts <their artifacts> --commit "recipe: <from> → <to> (OpenRewrite)"
 ```
 
-### Clean up after the recipes
+Check `verdict` is `SUCCESS`. A requested recipe with `0` in `filesWhereRecipeAppears` usually means a wrong name or a missing artifact.
 
-Recipes leave noise in the build file. Read the build-file diff and clean it in a separate commit (`llm: clean up after recipes — …`), so the reviewer sees recipe output and cleanup apart:
+## 4. Clean up after the recipes — one commit
 
-- **Explicit versions on dependencies the platform BOM manages** (for example `spring-boot-starter-webmvc-test:4.0.8` under the Spring Boot plugin): remove the version so the BOM decides again. Check with `dependencyInsight` (`reference/gradle.md`) or `dependency:tree` that the resolved version is the BOM's afterwards.
-- **Dependencies the code does not need** (a `javax` compatibility API, a servlet API pinned to an older version than the BOM's): remove them only if the build and tests stay green without them; otherwise keep and report.
-- **Plugins, generators and annotation processors the recipes did not upgrade:** if they have a release that supports the target stack natively, raise them to it (newest release that the release notes or the project's GitHub say supports the target) — a native option beats a compatibility switch of an old version. Example: openapi-generator 7.x generates Spring Boot 4 / Jackson 3 code directly, 6.x only knows `useSpringBoot3`.
-- **Build-script deprecations reported by the new Gradle** — the `w: build.gradle.kts:…: '…' is deprecated` lines in the first build after the recipes (commands in `reference/gradle.md`): fix them now — `$buildDir`, `Project.buildDir`, conventions; they turn into errors with the next major.
+Work through `cleanupHints`, then commit as `llm: clean up after recipes — …`:
 
-List every cleanup change in the report with its reason.
-
-## 4. Build and read the errors
-
-Build with tests on the **target** JDK. Never let the build output into your context — a failed build is hundreds of lines (one migration produced 1,100 lines for two errors), and a test report carries full stack traces. Send the output to a log file outside the repository and pull out only what you need with the commands in `reference/gradle.md` / `reference/maven.md`:
-
-- the build verdict and the first lines of "What went wrong";
-- compile errors grouped by message and by file — the counts tell you the causes;
-- names of failed tests and the first lines of each failure, without stack traces.
-
-Open more of the log only for one specific error you cannot understand from those lines, and only around it.
-
-Group errors by cause. One missing package usually produces a dozen "cannot find symbol" errors; fix the cause, not every line. javac stops at 100 errors — a count of exactly 100 means there are more behind them.
-
-javac reports errors in waves: while a package is missing it does not look deeper. Expect new errors after each fix — that is progress, not a regression, as long as the old ones are gone.
+- explicit versions on dependencies the BOM manages → remove the version;
+- dependencies the code does not need (old `javax` APIs, a servlet API pinned below the BOM) → remove if the build stays green;
+- plugins and code generators the recipes left behind → raise to the release that supports the target natively (openapi-generator 7.x: `useSpringBoot4`, `useJackson3`) rather than a compatibility switch of the old one;
+- build-script deprecations (`$buildDir` → `layout.buildDirectory`; `BuildReport` lists the rest under `buildScriptDeprecations` in the first build).
 
 ## 5. Fix the tail in a loop
 
-Each iteration: pick a group of errors → make the **minimal** change → build again → commit:
+`BuildReport.java --task compile` while there are compile errors (faster), then `--task build`. Read the JSON; open the log only around one error you cannot understand from it.
 
-```
-llm: Spring Framework 7 — ListenableFuture → CompletableFuture in NotificationSender
-```
+- **Fix causes, not lines.** One missing package gives a dozen "cannot find symbol". javac reports in waves and stops at 100 — new errors after a fix are progress.
+- **Real API, not memory.** Migration notes, then `javap -public -cp <jar> <class>` on the new version.
+- **Generated code is fixed at its source** — the generator's version or configuration, never the generated files.
+- **Build scripts are code** — keep pinned tool versions (the wrapper task's `gradleVersion`) in sync with the recipes.
+- **Budget:** 10 iterations; stop if the error count did not drop for two in a row and report where you are stuck.
+- **Commit per wave:** `llm: <what broke> — <what you changed>`, causes listed in the message.
 
-- **Use the real API, not memory.** For a new library version, read its migration notes and the actual signatures (`javap -public -cp <jar> <class>` or the sources jar). New Spring Boot / Spring / Hibernate versions move and rename classes; check before you guess — the framework migration guides on GitHub list most of the moves.
-- **Generated code is fixed at its source.** Errors in generated sources (OpenAPI, protobuf, JAXB, MapStruct output under `build/` or `target/`) are not fixed by editing the generated files — they are overwritten on the next build. Prefer a generator version that supports the target stack natively; a compatibility option of the old version (for example the switch from `javax` to `jakarta`) is the fallback. Say which you did in the report.
-- **Build scripts are code too.** Fix the build script with the same care as Java code, and keep values that pin tool versions (like the wrapper task's `gradleVersion`) in sync with what the recipes changed.
-- **Budget:** at most 10 iterations. Stop early if the number of errors has not decreased for two iterations in a row — you are going in circles; report where you are stuck instead of trying random things.
-- **Stay on the task.** Do not refactor, reformat or "improve" code that compiles.
+**Never** (the hook enforces the first three; the rest is on you):
 
-### What you must not do, and why
+- delete tests, add `@Disabled` / `@Ignore`, remove assertions;
+- change what a test checks — adapting it to a renamed type or method is fine, and goes into the report;
+- pick dependency versions by hand — exceptions, each reported: the target version of a library without a recipe; removing a version so the BOM manages it; raising a plugin or generator to a release that supports the target;
+- silence problems (`@SuppressWarnings` on removals, skipping tests).
 
-The goal is a migrated project that is as correct as it was before. A green build obtained by weakening the checks is worse than a red build, because it hides the breakage.
+If the only way forward breaks one of these, stop and ask.
 
-- Do not delete tests, add `@Disabled` / `@Ignore`, or comment tests out.
-- Do not weaken assertions: no removing `assert`s, no loosening expected values, no catching and swallowing exceptions in tests.
-- Change a test only to adapt it to a changed API (a type or method was renamed, a constructor takes `Duration` instead of `long`) and keep what it checks the same. Mention every such change in the report.
-- Do not pick dependency versions by hand. Versions are the recipes' and the BOM's job; a hand-picked version is invisible in the recipe log and easy to get wrong. The exceptions are explicit and each goes into the report: the target version of the library being migrated; removing a version so the BOM manages it again; raising a plugin, generator or annotation processor to a release that supports the target stack (see "Clean up after the recipes").
-- Do not silence problems: no `@SuppressWarnings` to hide removals, no `-Xlint` tweaks, no skipping tests in the build.
-
-If the only way forward breaks one of these rules, stop and ask the user.
-
-## 6. Report recipe candidates
-
-Writing recipes is not part of a migration. A recipe is written once, by the library's team, tested and published for every service — not packed into each service separately (that is the job of the `openrewrite-recipe-author` skill).
-
-What you do: if you made the same kind of fix three or more times for a library and no recipe covered it, put two or three before/after examples into the report under "Recipe candidates", with the library name and version. That is a ready task for the recipe authors; the next service then gets the fix from the recipe instead of from you.
-
-## 7. Report
-
-Finish with a report for the reviewer:
+## 6. Report
 
 ```
 ## Migration report
-
-**Result:** build green / red, tests N passed of M (baseline: M)
-**Versions:** Spring Boot A → B, Java X → Y, <library> P → Q, Gradle/Maven wrapper R → S
-
+**Result:** build green / red, tests N of M (baseline M)
+**Versions:** <component> A → B, …
 ### Upgrade plan
-- <target> → requires <prerequisite> — covered by <recipe> / done by hand
-
+- <target> → needs <prerequisite> — <recipe> / by hand
 ### Done by recipes
-- <recipe> — <what it changed, in one line>
-
-### Fixed by hand (commits `llm:`)
-- <file>: <what and why>
-
+- <recipe> — <what it changed>
+### Cleanup and fixes (commits `llm:`)
+- <file or area>: <what and why>
 ### Tests changed to follow an API change
-- <test>: <old call> → <new call>; the check itself is unchanged
-
+- <test>: <old call> → <new call>; what it checks is unchanged
 ### For the reviewer
-- <things recipes added that deserve a look: explicit versions, compatibility dependencies>
-- <anything left unfinished and why>
-
+- <anything uncertain or left undone>
 ### Recipe candidates
-- <library> <version>: <kind of change>, seen N times — before: `<code>` → after: `<code>`
+- <library> <version>: <kind of change>, seen N times — before `<code>` → after `<code>`
 ```
+
+Recipe candidates are repeated hand fixes for a library that has no recipe for them — a ready task for the library's team (`openrewrite-recipe-author` skill), so the next service gets the fix from a recipe.
+
+Manual commands, if a script cannot run: `reference/gradle.md`, `reference/maven.md`.

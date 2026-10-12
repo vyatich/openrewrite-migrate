@@ -1,5 +1,7 @@
 # Gradle projects
 
+> The scripts in `scripts/` (`BuildReport.java`, `RunRecipes.java`) do all of this in one call each. Read this file only if a script cannot run, or to understand what it does.
+
 ## Which JDK starts which Gradle
 
 Gradle refuses to start on a JDK newer than it knows. Pick `JAVA_HOME` by the version in `gradle/wrapper/gradle-wrapper.properties`:
