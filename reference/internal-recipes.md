@@ -8,4 +8,4 @@ A library that is not in the table may still have a recipe: look in its migratio
 
 | Library | From → to | Recipe | Artifact | Not covered by the recipe |
 | --- | --- | --- | --- | --- |
-| `com.corp:corp-commons` (example: the demo library of this repository) | 1.x → 2.0 | `com.corp.commons.MigrateToCorpCommons2` | `com.corp:corp-commons-recipes:2.0.0` | `CorpHttpClient` timeouts `long` → `Duration` |
+| `com.corp:corp-commons` (example: the demo library of [joker-migrator](https://github.com/vyatich/joker-migrator)) | 1.x → 2.0 | `com.corp.commons.MigrateToCorpCommons2` | `com.corp:corp-commons-recipes:2.0.0` | `CorpHttpClient` timeouts `long` → `Duration` |
