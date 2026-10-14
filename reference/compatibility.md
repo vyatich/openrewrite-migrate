@@ -9,6 +9,8 @@ What a target version pulls along. Numbers move with every release — treat the
 | Spring Boot 3.x | Java 17+, Jakarta EE 10 (`javax` → `jakarta`), Spring Framework 6, Spring Security 6, Hibernate 6 | `UpgradeSpringBoot_3_x` (includes `UpgradeToJava17` and the jakarta migration) |
 | Spring Boot 4.0 | Java 17+ (supports up to 25), Spring Framework 7, Spring Security 7, Hibernate 7.1, Jackson 3, Gradle 8.14+ or 9, Kotlin 2.2 if Kotlin is used | `UpgradeSpringBoot_4_0` (chains all 3.x steps, bumps the Gradle wrapper to 8.14+) — **not** a newer Java than 17 |
 | Java 21 / 25 | Gradle that runs on that JDK (8.5+ for 21, 9.1+ for 25 — table in `gradle.md`); Maven 3.9+; annotation processors and bytecode tools that know the class file version | `UpgradeToJava21` / `UpgradeToJava25` (Gradle wrapper and common plugins) |
+| Jakarta EE 10 (without Spring) | Java 11+, an application server or runtime that implements EE 10, `jakarta.*` versions of every EE API and of libraries that use them | `JakartaEE10` |
+| Quarkus, Micronaut, other frameworks | the minimum Java, build tool and Kotlin versions from the framework's migration guide | the framework's recipe or its own update tool (`recipe-catalog.md`) |
 
 Sources: Spring Boot "System Requirements" page in the reference docs and the migration guides in the `spring-projects/spring-boot` GitHub wiki; Gradle "Compatibility Matrix"; release notes of each tool.
 
@@ -18,7 +20,7 @@ Each of these fails on a JDK newer than it knows, often with misleading errors (
 
 | Tool | How it breaks | What to check |
 | --- | --- | --- |
-| Lombok (pinned version) | annotation processing silently does nothing or crashes; getters/constructors "missing" | version that supports the target JDK; `UpgradeToJava25` bumped 1.18.24 → 1.18.48 in our run |
+| Lombok (pinned version) | annotation processing silently does nothing or crashes; getters/constructors "missing" | version that supports the target JDK; `UpgradeToJava25` bumped a pinned 1.18.24 → 1.18.48 in a test run |
 | MapStruct, other annotation processors | processor errors at compile time | release notes for the target JDK |
 | Code generators (openapi-generator, protobuf, jaxb) | generated code uses `javax`, old APIs | a plugin version that supports the target natively (openapi-generator 7.x: `useSpringBoot4`, `useJackson3` for Spring Boot 4; 6.x only has `useSpringBoot3`); the generator's release notes on GitHub; recipes touch neither the version nor the configuration |
 | Mockito / ByteBuddy | "Java 25 (69) is not supported" at test time | versions managed by the Spring Boot BOM are fine; pinned ones need a bump |

@@ -25,12 +25,16 @@ import java.util.stream.Stream;
  *
  * <pre>
  * java RunRecipes.java --recipes R1,R2 [--artifacts g:a:v,g:a:v] [--project DIR]
+ *                      [--repos URL,URL] [--plugin-repo URL]
  *                      [--dry-run] [--java-home DIR] [--maven-plugin-version V]
  *                      [--commit "recipe: ..."] [--author "Name &lt;email&gt;"] [--build gradle|maven]
  * </pre>
  *
  * Gradle uses rewrite-init.gradle next to this script (it pins the OpenRewrite Gradle plugin) and
- * runs on the newest installed JDK that the project's wrapper supports. Needs JDK 17+ to run.
+ * runs on the newest installed JDK that the project's wrapper supports. --repos: extra Maven
+ * repositories for the recipe artifacts (Gradle; for Maven declare them in the pom or settings.xml).
+ * --plugin-repo: where to get the OpenRewrite Gradle plugin itself when Maven Central and the
+ * Gradle Plugin Portal are not reachable (a company mirror). Needs JDK 17+ to run.
  */
 public class RunRecipes {
 
@@ -68,8 +72,15 @@ public class RunRecipes {
             if (opt.containsKey("artifacts")) {
                 command.add("-Drewrite.recipeArtifactCoordinates=" + opt.get("artifacts"));
             }
+            if (opt.containsKey("repos")) {
+                command.add("-Drewrite.recipeRepositories=" + opt.get("repos"));
+            }
             // old Gradle versions give the build 512 MB; the recipe run needs more or the daemon hangs
             command.addAll(List.of("-Dorg.gradle.jvmargs=-Xmx2g", "--no-daemon", "--console=plain"));
+            // the recipe run is not configuration-cache compatible; the flag exists since Gradle 6.6
+            if (gradleAtLeast(gradleVersion, 6, 6)) {
+                command.add("--no-configuration-cache");
+            }
         } else {
             String version = opt.getOrDefault("maven-plugin-version", MAVEN_PLUGIN_VERSION);
             command.addAll(List.of("-B", "org.openrewrite.maven:rewrite-maven-plugin:" + version + (dryRun ? ":dryRun" : ":run"),
@@ -77,17 +88,25 @@ public class RunRecipes {
             if (opt.containsKey("artifacts")) {
                 command.add("-Drewrite.recipeArtifactCoordinates=" + opt.get("artifacts"));
             }
+            if (opt.containsKey("repos")) {
+                out.put("reposNote", "--repos is ignored for Maven: recipe artifacts resolve through the repositories of the pom"
+                    + " and ~/.m2/settings.xml - declare the repository there");
+            }
         }
         out.put("command", String.join(" ", command));
+        Map<String, String> env = new LinkedHashMap<>();
+        if (opt.containsKey("plugin-repo")) {
+            env.put("REWRITE_PLUGIN_REPOSITORY", opt.get("plugin-repo")); // read by rewrite-init.gradle
+        }
 
         Path log = Files.createTempFile("run-recipes-", ".log");
         Instant started = Instant.now();
-        int exit = run(command, project, jdk[0], log);
+        int exit = run(command, project, jdk[0], env, log);
         List<String> lines = read(log);
         if (!succeeded(lines, exit) && lines.stream().anyMatch(l -> l.contains("SocketException") || l.contains("Connection reset")
                 || l.contains("Read timed out") || l.contains("Could not GET"))) {
             out.put("retried", "network error on the first attempt");
-            exit = run(command, project, jdk[0], log);
+            exit = run(command, project, jdk[0], env, log);
             lines = read(log);
         }
         // the build tool's own verdict decides: old gradlew.bat versions can exit non-zero after BUILD SUCCESSFUL
@@ -119,14 +138,20 @@ public class RunRecipes {
         List<String> changed = git(project, "status", "--porcelain", "--", ".");
         out.put("changedFiles", changed.size());
         out.put("files", changed.stream().map(l -> l.substring(3)).limit(40).collect(Collectors.toList()));
-        List<String> buildFiles = Stream.of("build.gradle.kts", "build.gradle", "settings.gradle.kts", "settings.gradle",
-                "gradle/libs.versions.toml", "gradle.properties", "pom.xml")
-            .filter(f -> Files.exists(project.resolve(f))).collect(Collectors.toList());
-        List<String> diffArgs = new ArrayList<>(List.of("diff", "-U0", "--"));
-        diffArgs.addAll(buildFiles);
-        List<String> buildDiff = git(project, diffArgs.toArray(String[]::new)).stream()
-            .filter(l -> (l.startsWith("+") || l.startsWith("-")) && !l.startsWith("+++") && !l.startsWith("---"))
-            .limit(40).collect(Collectors.toList());
+        List<String> buildFiles = buildFiles(project);
+        List<String> buildDiff = new ArrayList<>();
+        if (!buildFiles.isEmpty()) {
+            List<String> diffArgs = new ArrayList<>(List.of("diff", "-U0", "--no-color", "--relative", "--"));
+            diffArgs.addAll(buildFiles);
+            String file = null;
+            for (String l : git(project, diffArgs.toArray(String[]::new))) {
+                if (l.startsWith("+++ ")) {
+                    file = l.substring(4).replaceFirst("^b/", "");
+                } else if ((l.startsWith("+") || l.startsWith("-")) && !l.startsWith("---") && buildDiff.size() < 60) {
+                    buildDiff.add(file + ": " + l);
+                }
+            }
+        }
         out.put("buildFileDiff", buildDiff);
         out.put("cleanupHints", cleanupHints(project, buildFiles));
 
@@ -191,29 +216,119 @@ public class RunRecipes {
         return counts;
     }
 
+    /**
+     * Build files of every module, relative to the project: Gradle scripts in both DSLs (including
+     * buildSrc and convention plugins), version catalogs, gradle.properties, Maven poms. Tracked
+     * files only, so build output and vendored code are left out.
+     */
+    static List<String> buildFiles(Path project) throws IOException, InterruptedException {
+        return git(project, "ls-files", "--", ".").stream()
+            .filter(f -> {
+                String name = f.substring(f.lastIndexOf('/') + 1);
+                return name.matches("(build|settings)\\.gradle(\\.kts)?|.*\\.gradle(\\.kts)?|gradle\\.properties|.*\\.versions\\.toml|pom\\.xml");
+            })
+            .filter(f -> Files.exists(project.resolve(f)))
+            .collect(Collectors.toList());
+    }
+
+    /** Group prefixes whose versions a framework BOM manages, by a marker that the BOM is in use. */
+    static final Map<String, List<String>> BOMS = Map.of(
+        "org.springframework.boot", List.of("org.springframework", "jakarta.", "com.fasterxml.jackson", "tools.jackson",
+            "org.hibernate", "io.micrometer", "org.junit", "org.mockito", "org.assertj", "org.flywaydb", "org.liquibase",
+            "ch.qos.logback", "org.slf4j", "org.apache.tomcat", "io.projectreactor", "com.zaxxer", "org.postgresql"),
+        "io.quarkus", List.of("io.quarkus", "jakarta.", "org.hibernate", "io.smallrye", "com.fasterxml.jackson", "org.junit"),
+        "io.micronaut", List.of("io.micronaut", "jakarta.", "com.fasterxml.jackson", "org.junit"));
+
+    /** Code generators and JDK-sensitive tools: their version decides whether they support the target stack. */
+    static final Pattern GENERATOR = Pattern.compile(
+        ".*(openapi-generator|org\\.openapi\\.generator|swagger-codegen|jsonschema2pojo|protobuf|jaxb2?-maven-plugin|maven-jaxb2|"
+            + "cxf-codegen|com\\.github\\.bjornvester\\.xjc|avro|jooq-codegen|nu\\.studer\\.jooq|wsimport|jaxws-maven-plugin).*");
+    static final Pattern JDK_TOOL = Pattern.compile(
+        ".*(org\\.projectlombok|io\\.freefair\\.lombok|org\\.mapstruct|jacoco|errorprone|net\\.bytebuddy|kotlin).*");
+
     /** Things the cleanup step should look at; the agent decides what to do with them. */
     static List<String> cleanupHints(Path project, List<String> buildFiles) throws IOException {
-        List<String> hints = new ArrayList<>();
+        Map<String, List<String>> contents = new LinkedHashMap<>();
         for (String f : buildFiles) {
-            List<String> lines = read(project.resolve(f));
-            boolean bootPlugin = lines.stream().anyMatch(l -> l.contains("org.springframework.boot"));
+            contents.put(f, read(project.resolve(f)));
+        }
+        // the BOM is usually applied once (root, parent pom, convention plugin) and manages every module
+        String all = contents.values().stream().flatMap(List::stream).collect(Collectors.joining("\n"));
+        List<String> managed = BOMS.entrySet().stream().filter(e -> all.contains(e.getKey()))
+            .flatMap(e -> e.getValue().stream()).distinct().collect(Collectors.toList());
+
+        List<String> hints = new ArrayList<>();
+        contents.forEach((f, lines) -> {
+            if (f.endsWith("pom.xml")) {
+                pomHints(f, String.join("\n", lines), managed, hints);
+                return;
+            }
             for (String l : lines) {
                 String t = l.strip();
-                if (bootPlugin && t.matches(".*\"(org\\.springframework[^\":]*|jakarta\\.[^\":]*):[^\":]+:[0-9][^\"]*\".*")) {
-                    hints.add(f + ": explicit version on a BOM-managed dependency - " + t);
+                if (t.startsWith("//") || t.startsWith("#")) {
+                    continue;
                 }
-                if (t.matches(".*\"javax\\.[^\":]+:[^\":]+:.*")) {
-                    hints.add(f + ": javax dependency after a jakarta migration - " + t);
+                // "g:a:v" / 'g:a:v', group: 'g', name: 'a', version: 'v', catalog module = "g:a", version = "v"
+                Optional<String> group = coordinateGroup(t);
+                boolean versioned = t.matches(".*[\"'][^\"':\\s]+:[^\"':\\s]+:[0-9$][^\"']*[\"'].*")
+                    || t.matches(".*\\bversion(\\.ref)?\\s*[:=]\\s*[\"'].*");
+                if (group.isPresent() && versioned && managed.stream().anyMatch(group.get()::startsWith)) {
+                    hints.add(f + ": explicit version on a dependency the framework BOM probably manages - " + t);
                 }
-                if (t.matches(".*id\\(\"org\\.openapi\\.generator\"\\).*version.*") || t.contains("openapi-generator-maven-plugin")) {
-                    hints.add(f + ": code generator plugin - check it supports the target stack natively - " + t);
+                if (group.isPresent() && group.get().startsWith("javax.")) {
+                    hints.add(f + ": javax dependency - after a jakarta migration usually not needed - " + t);
                 }
-                if (t.matches(".*(\\$buildDir|\\bbuildDir\\b).*") && !t.contains("buildDirectory")) {
+                if (GENERATOR.matcher(t).matches() && !t.startsWith("import")) {
+                    hints.add(f + ": code generator - check its version supports the target stack natively - " + t);
+                } else if (JDK_TOOL.matcher(t).matches() && (versioned || t.matches(".*\\d+\\.\\d+.*")) && !t.startsWith("import")) {
+                    hints.add(f + ": tool with JDK limits pinned - check it supports the target JDK - " + t);
+                }
+                if (f.contains(".gradle") && t.matches(".*(\\$buildDir|\\$\\{buildDir\\}|\\bbuildDir\\b|getBuildDir\\(\\)).*")
+                        && !t.contains("buildDirectory")) {
                     hints.add(f + ": deprecated buildDir - use layout.buildDirectory - " + t);
                 }
             }
+        });
+        return hints.stream().distinct().limit(25).collect(Collectors.toList());
+    }
+
+    static Optional<String> coordinateGroup(String t) {
+        Matcher m = Pattern.compile("[\"']([\\w.-]+):[\\w.-]+(?::[^\"']*)?[\"']").matcher(t);
+        if (m.find() && m.group(1).contains(".")) {
+            return Optional.of(m.group(1));
         }
-        return hints.stream().distinct().limit(15).collect(Collectors.toList());
+        m = Pattern.compile("\\b(?:group|module)\\s*[:=]\\s*[\"']([\\w.-]+)").matcher(t);
+        return m.find() ? Optional.of(m.group(1)) : Optional.empty();
+    }
+
+    /** Dependencies and plugins of a pom: same checks as for Gradle, from the XML elements. */
+    static void pomHints(String f, String xml, List<String> managed, List<String> hints) {
+        // the BOM's own entries in dependencyManagement carry versions on purpose
+        String body = xml.replaceAll("(?s)<dependencyManagement>.*?</dependencyManagement>", "");
+        Matcher dep = Pattern.compile("(?s)<(dependency|plugin)>(.*?)</\\1>").matcher(body);
+        while (dep.find()) {
+            String block = dep.group(2);
+            String group = tag(block, "groupId").orElse(dep.group(1).equals("plugin") ? "org.apache.maven.plugins" : "");
+            String artifact = tag(block, "artifactId").orElse("");
+            Optional<String> version = tag(block, "version");
+            String coords = group + ":" + artifact + version.map(v -> ":" + v).orElse("");
+            if (dep.group(1).equals("dependency") && version.isPresent() && managed.stream().anyMatch(group::startsWith)) {
+                hints.add(f + ": explicit version on a dependency the framework BOM probably manages - " + coords);
+            }
+            if (group.startsWith("javax.")) {
+                hints.add(f + ": javax dependency - after a jakarta migration usually not needed - " + coords);
+            }
+            if (GENERATOR.matcher(coords).matches()) {
+                hints.add(f + ": code generator - check its version supports the target stack natively - " + coords);
+            } else if (JDK_TOOL.matcher(coords).matches() && version.isPresent()) {
+                hints.add(f + ": tool with JDK limits pinned - check it supports the target JDK - " + coords);
+            }
+        }
+    }
+
+    static Optional<String> tag(String block, String name) {
+        Matcher m = Pattern.compile("<" + name + ">\\s*([^<]+?)\\s*</" + name + ">").matcher(block);
+        return m.find() ? Optional.of(m.group(1)) : Optional.empty();
     }
 
     // ---------------------------------------------------------------- shared with BuildReport (single-file scripts)
@@ -227,12 +342,32 @@ public class RunRecipes {
     }
 
     static String gradleVersion(Path project) throws IOException {
-        Path props = project.resolve("gradle/wrapper/gradle-wrapper.properties");
-        if (!Files.exists(props)) {
+        Path props = findUp(project, "gradle/wrapper/gradle-wrapper.properties");
+        if (props == null) {
             return null;
         }
         Matcher m = Pattern.compile("gradle-(\\d+(?:\\.\\d+)*)-").matcher(Files.readString(props));
         return m.find() ? m.group(1) : null;
+    }
+
+    static boolean gradleAtLeast(String gradle, int major, int minor) {
+        if (gradle == null) {
+            return false;
+        }
+        String[] p = gradle.split("\\.");
+        int ma = Integer.parseInt(p[0]);
+        int mi = p.length > 1 ? Integer.parseInt(p[1]) : 0;
+        return ma > major || ma == major && mi >= minor;
+    }
+
+    /** The file at this relative path in dir or its nearest parent: a module of a bigger build has no wrapper of its own. */
+    static Path findUp(Path dir, String relative) {
+        for (Path d = dir; d != null; d = d.getParent()) {
+            if (Files.exists(d.resolve(relative))) {
+                return d.resolve(relative);
+            }
+        }
+        return null;
     }
 
     static int maxJdkFor(String gradle) {
@@ -267,8 +402,10 @@ public class RunRecipes {
         String home = System.getProperty("user.home");
         for (String dir : List.of("C:/Program Files/Eclipse Adoptium", "C:/Program Files/Java", "C:/Program Files/Microsoft",
                 "C:/Program Files/Amazon Corretto", "C:/Program Files/BellSoft", "C:/Program Files/Zulu",
-                "/usr/lib/jvm", "/Library/Java/JavaVirtualMachines", home + "/.sdkman/candidates/java",
-                home + "/.gradle/jdks", home + "/.jdks")) {
+                "C:/Program Files/OpenJDK", "C:/Program Files/RedHat", "C:/Program Files/Semeru", home + "/scoop/apps",
+                "/usr/lib/jvm", "/usr/java", "/opt", "/opt/java", "/Library/Java/JavaVirtualMachines",
+                "/opt/homebrew/opt", "/usr/local/opt", home + "/.sdkman/candidates/java", home + "/.asdf/installs/java",
+                home + "/.local/share/mise/installs/java", home + "/.gradle/jdks", home + "/.jdks")) {
             Path root = Path.of(dir);
             if (Files.isDirectory(root)) {
                 try (Stream<Path> children = Files.list(root)) {
@@ -278,10 +415,17 @@ public class RunRecipes {
                 }
             }
         }
-        Optional.ofNullable(System.getenv("JAVA_HOME")).map(Path::of).ifPresent(roots::add);
+        // JAVA_HOME and CI variables such as JAVA_HOME_21_X64
+        System.getenv().forEach((k, v) -> {
+            if (k.toUpperCase(Locale.ROOT).startsWith("JAVA_HOME") && !v.isBlank()) {
+                roots.add(Path.of(v));
+            }
+        });
         roots.add(Path.of(System.getProperty("java.home")));
         for (Path root : roots) {
-            for (Path candidate : List.of(root, root.resolve("Contents/Home"))) {
+            // plain layout, macOS bundle, Homebrew formula, scoop "current"
+            for (Path candidate : List.of(root, root.resolve("Contents/Home"), root.resolve("libexec/openjdk.jdk/Contents/Home"),
+                    root.resolve("current"))) {
                 Path release = candidate.resolve("release");
                 if (!Files.isRegularFile(release)) {
                     continue;
@@ -315,19 +459,21 @@ public class RunRecipes {
     static List<String> launcher(Path project, String tool) {
         String wrapper = tool.equals("gradle") ? "gradlew" : "mvnw";
         if (windows()) {
-            Path bat = project.resolve(wrapper + (tool.equals("gradle") ? ".bat" : ".cmd"));
-            return List.of("cmd", "/c", Files.exists(bat) ? bat.toString() : (tool.equals("gradle") ? "gradle" : "mvn"));
+            Path bat = findUp(project, wrapper + (tool.equals("gradle") ? ".bat" : ".cmd"));
+            return List.of("cmd", "/c", bat != null ? bat.toString() : (tool.equals("gradle") ? "gradle" : "mvn"));
         }
-        Path script = project.resolve(wrapper);
-        if (Files.exists(script)) {
+        Path script = findUp(project, wrapper);
+        if (script != null) {
             return Files.isExecutable(script) ? List.of(script.toString()) : List.of("sh", script.toString());
         }
         return List.of(tool.equals("gradle") ? "gradle" : "mvn");
     }
 
-    static int run(List<String> command, Path dir, String javaHome, Path log) throws IOException, InterruptedException {
+    static int run(List<String> command, Path dir, String javaHome, Map<String, String> env, Path log)
+            throws IOException, InterruptedException {
         ProcessBuilder pb = new ProcessBuilder(command).directory(dir.toFile()).redirectErrorStream(true)
             .redirectOutput(log.toFile());
+        pb.environment().putAll(env);
         if (javaHome != null) {
             pb.environment().put("JAVA_HOME", javaHome);
             String key = pb.environment().containsKey("Path") ? "Path" : "PATH";

@@ -4,15 +4,26 @@
 //
 //   ./gradlew rewriteRun --init-script rewrite-init.gradle \
 //     -Drewrite.activeRecipe=<recipe>,<recipe> \
-//     -Drewrite.recipeArtifactCoordinates=<group:artifact:version>,<group:artifact:version>
+//     -Drewrite.recipeArtifactCoordinates=<group:artifact:version>,<group:artifact:version> \
+//     [-Drewrite.recipeRepositories=<url>,<url>]
+//
+// Recipe artifacts resolve through the repositories the build already uses (settings,
+// root project or, failing that, the subprojects) plus -Drewrite.recipeRepositories.
+// The plugin itself comes from Maven Central and the Gradle Plugin Portal, or from the
+// mirror in the environment variable REWRITE_PLUGIN_REPOSITORY.
 //
 // Plugin 7.39.0 is pinned: 7.40.0 and 7.41.0 depend on a rewrite-bom that is not
 // published to Maven Central.
 
 initscript {
     repositories {
-        mavenCentral()
-        maven { url = uri("https://plugins.gradle.org/m2") }
+        def mirror = System.getenv("REWRITE_PLUGIN_REPOSITORY")
+        if (mirror) {
+            maven { url = uri(mirror) }
+        } else {
+            mavenCentral()
+            maven { url = uri("https://plugins.gradle.org/m2") }
+        }
     }
     dependencies {
         classpath("org.openrewrite:plugin:7.39.0")
@@ -21,21 +32,74 @@ initscript {
 
 // -D values from the command line are read from the start parameters: when init
 // scripts are evaluated they are not yet visible through System.getProperty
-def recipeArtifacts = (gradle.startParameter.systemPropertiesArgs["rewrite.recipeArtifactCoordinates"]
-        ?: System.getProperty("rewrite.recipeArtifactCoordinates")
-        ?: "")
-    .split(",")
-    .collect { it.trim() }
-    .findAll { !it.isEmpty() }
+def listProperty = { String name ->
+    (gradle.startParameter.systemPropertiesArgs[name] ?: System.getProperty(name) ?: "")
+        .split(",")
+        .collect { it.trim() }
+        .findAll { !it.isEmpty() }
+}
+def recipeArtifacts = listProperty("rewrite.recipeArtifactCoordinates")
+def extraRepositories = listProperty("rewrite.recipeRepositories")
+
+// Gradle 6.8+ can declare repositories once in settings (dependencyResolutionManagement).
+// A project that then declares its own stops using them, or fails the build under
+// FAIL_ON_PROJECT_REPOS - so with settings repositories nothing is added to projects.
+def settingsRepositories = false
+settingsEvaluated { settings ->
+    try {
+        def central = settings.dependencyResolutionManagement.repositories
+        settingsRepositories = !central.isEmpty()
+        if (settingsRepositories) {
+            extraRepositories.each { u -> central.maven { url = u } }
+        }
+    } catch (MissingPropertyException ignored) {
+        // Gradle < 6.8: repositories live in projects only
+    }
+}
 
 rootProject {
-    plugins.apply(org.openrewrite.gradle.RewritePlugin)
-    recipeArtifacts.each { dependencies.add("rewrite", it) }
-    afterEvaluate {
-        if (repositories.isEmpty()) {
-            repositories {
-                mavenCentral()
+    // a build that applies OpenRewrite itself keeps its own plugin; a second copy would clash
+    def ownPlugin = ["build.gradle", "build.gradle.kts"].any { f ->
+        def file = new File(rootDir, f)
+        file.exists() && file.text.contains("org.openrewrite.rewrite")
+    }
+    if (ownPlugin) {
+        afterEvaluate { recipeArtifacts.each { dependencies.add("rewrite", it) } }
+    } else {
+        plugins.apply(org.openrewrite.gradle.RewritePlugin)
+        recipeArtifacts.each { dependencies.add("rewrite", it) }
+    }
+}
+
+// after every project is configured: the root may have no repositories of its own,
+// while its subprojects (or settings) know where the company's artifacts live
+gradle.projectsEvaluated {
+    def root = gradle.rootProject
+    if (root.repositories.isEmpty() && !settingsRepositories) {
+        root.subprojects.each { p ->
+            p.repositories.withType(MavenArtifactRepository).each { r ->
+                if (!root.repositories.withType(MavenArtifactRepository).any { it.url == r.url }) {
+                    root.repositories.maven {
+                        url = r.url
+                        try {
+                            if (r.credentials?.username) {
+                                credentials {
+                                    username = r.credentials.username
+                                    password = r.credentials.password
+                                }
+                            }
+                        } catch (Exception ignored) {
+                            // repository without password credentials
+                        }
+                    }
+                }
             }
         }
+        if (root.repositories.isEmpty()) {
+            root.repositories.mavenCentral()
+        }
+    }
+    if (!root.repositories.isEmpty()) {
+        extraRepositories.each { u -> root.repositories.maven { url = u } }
     }
 }

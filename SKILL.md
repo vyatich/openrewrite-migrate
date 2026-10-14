@@ -1,6 +1,6 @@
 ---
 name: openrewrite-migrate
-description: Migrates a Java project (Maven or Gradle) to new versions of Spring Boot, Java, Jakarta EE or an internal library with breaking changes. OpenRewrite recipes do the bulk of the work; the agent then fixes only the remaining compile and test errors with minimal patches, without weakening tests, and reports what it changed. Use this skill whenever the user asks to upgrade or migrate Spring Boot, the Java version, javax to jakarta, bump a library to a new major version, apply a migration guide, or repair a build broken by such an upgrade — even if OpenRewrite is not mentioned.
+description: Migrates a Java or Kotlin project (Maven or Gradle, single- or multi-module) to new versions of Java, Spring Boot, Jakarta EE, other frameworks and libraries that have OpenRewrite recipes (JUnit, Micronaut, Quarkus, …), or an internal library with breaking changes. OpenRewrite recipes do the bulk of the work; the agent then fixes only the remaining compile and test errors with minimal patches, without weakening tests, and reports what it changed. Use this skill whenever the user asks to upgrade or migrate a framework, the Java version, javax to jakarta, JUnit 4 to 5, bump a library to a new major version, apply a migration guide, or repair a build broken by such an upgrade — even if OpenRewrite is not mentioned.
 ---
 
 # OpenRewrite migration
@@ -11,22 +11,24 @@ Three scripts in `scripts/` do the mechanical work in one call each and answer w
 
 | Script | Does |
 | --- | --- |
-| `java <skill>/scripts/BuildReport.java --project <dir> [--task compile\|build\|test] [--tests P]` | builds; verdict, compile errors grouped by cause, failed tests without stack traces, build-script deprecations |
-| `java <skill>/scripts/RunRecipes.java --project <dir> --recipes R1,R2 [--artifacts g:a:v,…] [--commit "…"] [--dry-run]` | runs recipes without editing the build, checks the run finished, lists changed files and cleanup hints, commits |
-| `java <skill>/scripts/CheckDiff.java --install-hook` | installs a pre-commit hook that refuses commits weakening tests |
+| `java <skill>/scripts/BuildReport.java --project <dir> [--task compile\|build\|test] [--tests P]` | builds every module; verdict, compile errors (Java, Kotlin) grouped by cause, failed tests of all modules without stack traces, build-script deprecations |
+| `java <skill>/scripts/RunRecipes.java --project <dir> --recipes R1,R2 [--artifacts g:a:v,…] [--repos URL,…] [--commit "…"] [--dry-run]` | runs recipes without editing the build, checks the run finished, lists changed files, the build-file diff of all modules and cleanup hints, commits |
+| `java <skill>/scripts/CheckDiff.java --install-hook` | installs a pre-commit hook that refuses commits weakening tests; an existing hook is kept and runs after it |
 
-They need JDK 17+ to start, detect Maven or Gradle and the wrapper themselves, and run Gradle on the newest installed JDK its version supports (an old wrapper cannot start on a new JDK). Override with `--java-home`.
+They need JDK 17+ to start, detect Maven or Gradle and the wrapper themselves (also in parent directories), and run Gradle on the newest installed JDK its version supports (an old wrapper cannot start on a new JDK). Override with `--java-home`. `<dir>` is the root of the build — where `settings.gradle(.kts)` or the parent `pom.xml` is — so every module is built and migrated.
+
+Recipe artifacts resolve through the repositories the build already uses. An internal recipe artifact in a repository the build does not know: pass it with `--repos` (Gradle) or add it to `~/.m2/settings.xml` (Maven). No access to Maven Central and the Gradle Plugin Portal: pass the company mirror with `--plugin-repo`.
 
 ## 1. Baseline
 
-1. The working tree must be clean; create a branch. Install the guard: `CheckDiff.java --install-hook`.
+1. The working tree must be clean; create a branch and note the commit you start from. Install the guard: `CheckDiff.java --install-hook`. If it answers `"installed":false` (the repository keeps its hooks in a tracked directory), run `CheckDiff.java --staged` yourself before every commit and do not commit while it reports a violation.
 2. `BuildReport.java --project <dir>` — the build must be green before you change anything; note the test count. If it is red, stop and tell the user: on a red baseline migration errors cannot be told from old ones.
-3. Read the build file for current versions, and the migration notes (`MIGRATION.md`, changelog) of every internal library you upgrade — they say what breaks and name the recipe the library team published.
+3. Read the build files for current versions — every module, the parent pom or convention plugins (`buildSrc/`, `build-logic/`), `gradle/libs.versions.toml`, `gradle.properties` — and the migration notes (`MIGRATION.md`, changelog) of every internal library you upgrade — they say what breaks and name the recipe the library team published.
 
 ## 2. Plan — two to four lines, before anything runs
 
-- **Prerequisites of the targets.** Spring Boot 4 needs Java 17+; Java 25 needs a Gradle that runs on it; annotation processors, code generators and bytecode tools need versions that know the target. Read `reference/compatibility.md` only if the project uses a tool you are not sure about.
-- **Recipes that cover them.** `UpgradeSpringBoot_4_0` brings Java to 17 and the Gradle wrapper along, but not Java to 25 — add `UpgradeToJava25`. Recipe names and the versions that work: `reference/recipe-catalog.md`. Look versions up online only if those fail or the user asked for the newest.
+- **Prerequisites of the targets.** For example, Spring Boot 4 needs Java 17+; Java 25 needs a Gradle that runs on it; annotation processors, code generators and bytecode tools need versions that know the target. Read `reference/compatibility.md` only if the project uses a tool you are not sure about.
+- **Recipes that cover them.** A framework recipe pulls some prerequisites along, not all: `UpgradeSpringBoot_4_0` brings Java to 17 and the Gradle wrapper along, but not Java to 25 — add `UpgradeToJava25`. Recipe names and the versions that work: `reference/recipe-catalog.md`. Look versions up online only if those fail or the user asked for the newest. A target the catalog does not list: find its recipe on docs.openrewrite.org (same file, last section). No recipe exists: the framework's migration guide is your plan, and the work is the tail of step 5.
 - **Internal recipes.** From the library's migration notes or `reference/internal-recipes.md`. Connect them, never write them.
 - **Exact landing versions.** A recipe targets one line (4.0.x); if a newer line exists without a recipe, say so and stay on the recipe's line unless the user asked otherwise.
 - If a target is impossible, say so now.
@@ -46,7 +48,8 @@ Work through `cleanupHints`, then commit as `llm: clean up after recipes — …
 - explicit versions on dependencies the BOM manages → remove the version;
 - dependencies the code does not need (old `javax` APIs, a servlet API pinned below the BOM) → remove if the build stays green;
 - plugins and code generators the recipes left behind → raise to the release that supports the target natively (openapi-generator 7.x: `useSpringBoot4`, `useJackson3`) rather than a compatibility switch of the old one;
-- build-script deprecations (`$buildDir` → `layout.buildDirectory`; `BuildReport` lists the rest under `buildScriptDeprecations` in the first build).
+- build-script deprecations (Gradle: `$buildDir` → `layout.buildDirectory`; `BuildReport` lists the rest under `buildScriptDeprecations` in the first build);
+- pinned tools with JDK limits (Lombok, MapStruct, Jacoco, Kotlin) → the release that supports the target JDK.
 
 ## 5. Fix the tail in a loop
 
@@ -56,19 +59,22 @@ Work through `cleanupHints`, then commit as `llm: clean up after recipes — …
 - **Real API, not memory.** Migration notes, then `javap -public -cp <jar> <class>` on the new version.
 - **Generated code is fixed at its source** — the generator's version or configuration, never the generated files.
 - **Build scripts are code** — keep pinned tool versions (the wrapper task's `gradleVersion`) in sync with the recipes.
+- **Multi-module builds** go on after a failing module, so one run shows the errors of all of them; each failed test names its `module`.
 - **Budget:** 10 iterations; stop if the error count did not drop for two in a row and report where you are stuck.
 - **Commit per wave:** `llm: <what broke> — <what you changed>`, causes listed in the message.
 
-**Never** (the hook enforces the first three; the rest is on you):
+**Never** (the hook enforces the first three and build settings that skip tests; the rest is on you):
 
 - delete tests, add `@Disabled` / `@Ignore`, remove assertions;
 - change what a test checks — adapting it to a renamed type or method is fine, and goes into the report;
 - pick dependency versions by hand — exceptions, each reported: the target version of a library without a recipe; removing a version so the BOM manages it; raising a plugin or generator to a release that supports the target;
-- silence problems (`@SuppressWarnings` on removals, skipping tests).
+- silence problems (`@SuppressWarnings` on removals, `skipTests`, `ignoreFailures`, excluding tests).
 
 If the only way forward breaks one of these, stop and ask.
 
 ## 6. Report
+
+First `CheckDiff.java --base <the commit you started from> --report-only`: the whole migration at once, recipe commit included.
 
 ```
 ## Migration report

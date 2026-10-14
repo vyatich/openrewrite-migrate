@@ -20,6 +20,20 @@ Checked end to end on 2026-10-11/12 (Spring Boot 2.7.18 / Java 11 → Spring Boo
 
 Spring Boot and Java recipes run together in one pass, with internal recipes added to the same run.
 
+## Other common migrations
+
+Not checked end to end here. Confirm the name and the artifact on docs.openrewrite.org before the run, and use the artifact version from the same release line as the ones above.
+
+| Migration | Recipe | Artifact |
+| --- | --- | --- |
+| Java 8 → 11 / → 17 | `org.openrewrite.java.migrate.Java8toJava11` / `UpgradeToJava17` | `rewrite-migrate-java` |
+| javax → jakarta (EE 9 namespace only) | `org.openrewrite.java.migrate.jakarta.JavaxMigrationToJakarta` | `rewrite-migrate-java` |
+| JUnit 4 → 5 | `org.openrewrite.java.testing.junit5.JUnit4to5Migration` | `org.openrewrite.recipe:rewrite-testing-frameworks` |
+| Micronaut 3 → 4 | `org.openrewrite.java.micronaut.Micronaut3to4Migration` | `org.openrewrite.recipe:rewrite-micronaut` |
+| Quarkus (any version step) | the project's own `quarkus update` (Quarkus CLI, or the `update` goal / task of the Quarkus Maven / Gradle plugin): it picks the OpenRewrite recipes for the step itself | — |
+
+A framework not listed: search docs.openrewrite.org for its name; recipes for many libraries live in `org.openrewrite.recipe:rewrite-<name>` artifacts. Also check the framework's own upgrade tooling — some ship their recipes themselves, like Quarkus.
+
 Moderne Source Available: free to use on your own code, not to resell as a service. Mention it in the report if the user might care.
 
 ## When to look things up, and where

@@ -37,6 +37,9 @@ No wrapper in the project? A system Gradle several majors newer than the project
 - Dry run first if you want to see the diff without changing files: `rewriteDryRun` instead of `rewriteRun`; the patch is written to `build/reports/rewrite/rewrite.patch`.
 - Check the end of the output for `BUILD SUCCESSFUL`. The recipe that upgrades the wrapper downloads the list of Gradle versions during the run; a network error there fails the whole run — just retry.
 - Your own `rewrite.yml` in the project root is picked up automatically.
+- Recipe artifacts resolve through the build's own repositories: settings (`dependencyResolutionManagement`), the root project or, if the root has none, the subprojects' repositories. Another repository: `-Drewrite.recipeRepositories=<url>,<url>`. The plugin itself comes from Maven Central and the Plugin Portal; behind a company mirror set `REWRITE_PLUGIN_REPOSITORY=<url>` in the environment.
+- A build that applies `org.openrewrite.rewrite` itself keeps its own plugin version; the init script only adds the recipe artifacts.
+- Configuration cache on (`org.gradle.configuration-cache=true`): add `--no-configuration-cache`, the recipe run does not support it.
 
 ## Build and errors
 
@@ -44,7 +47,8 @@ After the recipes the wrapper is new (for example 9.1) — run it on the target 
 
 ```bash
 LOG="${TMPDIR:-/tmp}/migrate-build.log"
-./gradlew build --no-daemon --console=plain > "$LOG" 2>&1; echo "exit=$?"
+# --continue: the other modules still build after one fails
+./gradlew build --continue --no-daemon --console=plain > "$LOG" 2>&1; echo "exit=$?"
 
 # 1. Verdict and the reason
 grep -E "^BUILD (SUCCESSFUL|FAILED)" "$LOG"
@@ -59,13 +63,17 @@ grep -E "^[0-9]+ errors?$" "$ERRS"
 grep ": error:" "$ERRS" | awk '/[\\\/](build|target)[\\\/]generated/{g++; next} /[\\\/]src[\\\/]test/{t++; next} {m++} END{print "generated", g+0, "| main", m+0, "| test", t+0}'
 grep -oE "error: .*" "$ERRS" | sort | uniq -c | sort -rn | head -15
 grep -A3 ": error: cannot find symbol" "$ERRS" | grep -oE "symbol: +.*" | tr -s ' ' | sort | uniq -c | sort -rn | head -15
+# Kotlin sources and .gradle.kts scripts: "e: file:///.../A.kt:12:5 message"
+grep -E "^e: " "$ERRS" | sed -E 's/^e: [^ ]+ //' | sort | uniq -c | sort -rn | head -15
 
 # 3. One concrete error with its source line, when you need it
-grep -A3 ": error:" "$ERRS" | grep -A3 "DeliveryClient.java" | head -8
+grep -A3 ": error:" "$ERRS" | grep -A3 "<FileName>.java" | head -8
 
 # 4. Failed tests: names and the first line of each failure, no stack traces
 grep -A1 -E " FAILED$" "$LOG" | grep -vE "^--$|Task :" | head -30
-grep -ohE 'tests="[0-9]+"|failures="[0-9]+"|errors="[0-9]+"|skipped="[0-9]+"' build/test-results/test/TEST-*.xml \
+# every module, every test task
+find . -path '*/build/test-results/*' -name 'TEST-*.xml' -not -path '*/node_modules/*' \
+  | xargs grep -ohE 'tests="[0-9]+"|failures="[0-9]+"|errors="[0-9]+"|skipped="[0-9]+"' \
   | awk -F'"' '{s[$1]+=$2} END{for (k in s) printf "%s%d ", k, s[k]; print ""}'
 ```
 
@@ -87,7 +95,7 @@ $errs | Select-String ': error: (.*)' | ForEach-Object { $_.Matches[0].Groups[1]
 Select-String -Path $log -Pattern ' FAILED$' -Context 0,1 | Select-Object -First 30
 ```
 
-One test class only: `./gradlew test --tests 'demo.shop.order.OrderServiceTest'` — cheaper than the full build while you fix one failing test.
+One test class only: `./gradlew :<module>:test --tests 'com.example.SomeServiceTest'` — cheaper than the full build while you fix one failing test. Without `:<module>:` every module runs the filter, and modules with no matching test fail unless `filter.failOnNoMatchingTests = false` (`BuildReport.java --tests` sets it for you).
 
 ## Cleaning up after the recipes
 
@@ -100,7 +108,7 @@ Which version wins for a dependency, and why (use the configuration where the de
 
 An explicit version shows up as `requested` next to the module. After removing it, the version should be chosen by the BOM: "selected by rule" with the `io.spring.dependency-management` plugin, "By constraint" with a Gradle `platform(...)`.
 
-Deprecated build DSL that the next Gradle major will remove. The Kotlin DSL reports it while compiling the build script — that happens in the first build after the build file changed (the recipe commit), so look in that build's log:
+Deprecated build DSL that the next Gradle major will remove. Both DSLs: run with `--warning-mode all` and grep for `has been deprecated`; Gradle prints `Build file '…': line N` on the line before. The Kotlin DSL also reports it while compiling the build script — that happens in the first build after the build file changed (the recipe commit), so look in that build's log:
 
 ```bash
 grep -E "^w: .*\.gradle(\.kts)?:[0-9]+:[0-9]+: .*deprecated" "$LOG" | sed -E 's|.*[/\\]||' | sort -u
@@ -113,4 +121,4 @@ Typical fix: `"$buildDir/x"` → `layout.buildDirectory.dir("x")` (a `Provider`;
 
 ## Where versions live
 
-When checking that dependency versions were not changed by hand, look at all of them: `build.gradle(.kts)`, `gradle/libs.versions.toml`, `gradle.properties`, `settings.gradle(.kts)` (plugin management).
+When checking that dependency versions were not changed by hand, look at all of them: `build.gradle(.kts)` of every module, convention plugins in `buildSrc/` or an included `build-logic/` build, `gradle/libs.versions.toml`, `gradle.properties`, `settings.gradle(.kts)` (plugin management). `RunRecipes.java` lists all of them in `buildFileDiff`.

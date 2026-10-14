@@ -25,16 +25,19 @@ import java.util.stream.Stream;
 
 /**
  * Builds a Maven or Gradle project and prints a compact JSON report instead of the build log:
- * verdict, compile errors grouped by cause, failed tests without stack traces, build-script
- * deprecations. The full log goes to a file outside the project.
+ * verdict, compile errors (Java and Kotlin) grouped by cause, failed tests without stack traces,
+ * build-script deprecations. The full log goes to a file outside the project. Multi-module builds
+ * are covered: test reports are collected from every module, the build goes on after the first
+ * failing module (--continue / -fae) so one run shows all of them.
  *
  * <pre>
  * java BuildReport.java [--project DIR] [--task build|compile|test] [--tests PATTERN]
  *                       [--java-home DIR] [--offline] [--build gradle|maven]
  * </pre>
  *
- * Gradle runs on a JDK it supports: if --java-home is not given, the newest installed JDK that the
- * project's wrapper version can start on is picked. Needs JDK 17+ to run this script itself.
+ * The wrapper is looked up in DIR and its parents. Gradle runs on a JDK it supports: if
+ * --java-home is not given, the newest installed JDK that the wrapper version can start on is
+ * picked. Needs JDK 17+ to run this script itself.
  */
 public class BuildReport {
 
@@ -43,6 +46,9 @@ public class BuildReport {
         Path project = Path.of(opt.getOrDefault("project", ".")).toAbsolutePath().normalize();
         Tool tool = Tool.detect(project, opt.get("build"));
         String task = opt.getOrDefault("task", "build");
+        if (opt.containsKey("tests") && task.equals("build")) {
+            task = "test"; // a test filter belongs to the test task; "build --tests" is rejected by Gradle
+        }
 
         Json report = new Json();
         report.put("project", project.toString());
@@ -88,13 +94,15 @@ public class BuildReport {
         }
         // Gradle skips an unchanged test task; then the last reports are still the current ones
         boolean testsUpToDate = lines.stream().anyMatch(l -> l.matches("> Task :\\S*test (UP-TO-DATE|FROM-CACHE)"));
-        Tests tests = Tests.collect(project, tool, testsUpToDate ? Instant.EPOCH : started.minusSeconds(2));
+        Tests tests = Tests.collect(project, testsUpToDate ? Instant.EPOCH : started.minusSeconds(2));
         if (tests.total > 0) {
             Json testJson = tests.toJson();
             if (testsUpToDate) {
                 testJson.put("note", "test task was up to date: results of the last run, tests were not re-executed");
             }
             report.put("tests", testJson);
+        } else if (opt.containsKey("tests") && success) {
+            report.put("testsNote", "no test matched --tests " + opt.get("tests"));
         }
         List<String> deprecations = Logs.buildScriptDeprecations(lines);
         if (!deprecations.isEmpty()) {
@@ -107,9 +115,9 @@ public class BuildReport {
 
     static String summary(boolean success, Compile compile, Tests tests) {
         if (!compile.errors.isEmpty()) {
-            return String.format("FAILED: %d compile errors (generated %d, main %d, test %d)%s",
-                compile.errors.size(), compile.byLocation.getOrDefault("generated", 0),
-                compile.byLocation.getOrDefault("main", 0), compile.byLocation.getOrDefault("test", 0),
+            String where = compile.byLocation.entrySet().stream().map(e -> e.getKey() + " " + e.getValue())
+                .collect(Collectors.joining(", "));
+            return String.format("FAILED: %d compile errors (%s)%s", compile.errors.size(), where,
                 compile.javacCount != null && compile.javacCount >= 100 ? " - javac stopped at 100, more behind" : "");
         }
         if (tests.failed > 0) {
@@ -140,7 +148,8 @@ public class BuildReport {
             if (!name.equals("gradle")) {
                 return null;
             }
-            Path props = project.resolve("gradle/wrapper/gradle-wrapper.properties");
+            Path props = Optional.ofNullable(Run.findUp(project, "gradle/wrapper/gradle-wrapper.properties"))
+                .orElse(project.resolve("gradle/wrapper/gradle-wrapper.properties"));
             if (!Files.exists(props)) {
                 return null;
             }
@@ -148,30 +157,39 @@ public class BuildReport {
             return m.find() ? m.group(1) : null;
         }
 
-        List<String> command(Path project, String task, Map<String, String> opt) {
+        List<String> command(Path project, String task, Map<String, String> opt) throws IOException {
             List<String> cmd = new ArrayList<>(Run.launcher(project, name));
             if (name.equals("gradle")) {
                 switch (task) {
-                    case "compile" -> cmd.addAll(List.of("compileJava", "compileTestJava"));
+                    // lifecycle tasks: compile every language of main and test (Java, Kotlin, Groovy) in every module
+                    case "compile" -> cmd.addAll(List.of("classes", "testClasses"));
                     case "test" -> cmd.add("test");
                     default -> cmd.add("build");
                 }
                 if (opt.containsKey("tests")) {
                     cmd.addAll(List.of("--tests", opt.get("tests")));
+                    // in a multi-module build most modules have no matching test; that must not fail them
+                    Path init = Files.createTempFile("build-report-", ".gradle");
+                    Files.writeString(init, "allprojects { tasks.withType(Test).configureEach { filter.failOnNoMatchingTests = false } }\n");
+                    cmd.addAll(List.of("--init-script", init.toString()));
                 }
-                cmd.addAll(List.of("--console=plain", "--no-daemon"));
+                // --continue: the other modules still compile and test after one fails
+                // --warning-mode all: deprecations used by the build scripts, with file and line
+                cmd.addAll(List.of("--continue", "--warning-mode", "all", "--console=plain", "--no-daemon"));
                 if (opt.containsKey("offline")) {
                     cmd.add("--offline");
                 }
             } else {
-                cmd.add("-B");
+                cmd.addAll(List.of("-B", "-fae"));
                 switch (task) {
                     case "compile" -> cmd.add("test-compile");
                     case "test" -> cmd.add("test");
                     default -> cmd.add("verify");
                 }
                 if (opt.containsKey("tests")) {
-                    cmd.add("-Dtest=" + opt.get("tests"));
+                    // modules without a matching test must not fail (property name differs between Surefire versions)
+                    cmd.addAll(List.of("-Dtest=" + opt.get("tests"), "-Dsurefire.failIfNoSpecifiedTests=false",
+                        "-DfailIfNoTests=false"));
                 }
                 if (opt.containsKey("offline")) {
                     cmd.add("-o");
@@ -231,8 +249,10 @@ public class BuildReport {
             String home = System.getProperty("user.home");
             for (String dir : List.of("C:/Program Files/Eclipse Adoptium", "C:/Program Files/Java", "C:/Program Files/Microsoft",
                     "C:/Program Files/Amazon Corretto", "C:/Program Files/BellSoft", "C:/Program Files/Zulu",
-                    "/usr/lib/jvm", "/Library/Java/JavaVirtualMachines", home + "/.sdkman/candidates/java",
-                    home + "/.gradle/jdks", home + "/.jdks")) {
+                    "C:/Program Files/OpenJDK", "C:/Program Files/RedHat", "C:/Program Files/Semeru", home + "/scoop/apps",
+                    "/usr/lib/jvm", "/usr/java", "/opt", "/opt/java", "/Library/Java/JavaVirtualMachines",
+                    "/opt/homebrew/opt", "/usr/local/opt", home + "/.sdkman/candidates/java", home + "/.asdf/installs/java",
+                    home + "/.local/share/mise/installs/java", home + "/.gradle/jdks", home + "/.jdks")) {
                 Path root = Path.of(dir);
                 if (Files.isDirectory(root)) {
                     try (Stream<Path> children = Files.list(root)) {
@@ -242,11 +262,18 @@ public class BuildReport {
                     }
                 }
             }
-            Optional.ofNullable(System.getenv("JAVA_HOME")).map(Path::of).ifPresent(roots::add);
+            // JAVA_HOME and CI variables such as JAVA_HOME_21_X64
+            System.getenv().forEach((k, v) -> {
+                if (k.toUpperCase(Locale.ROOT).startsWith("JAVA_HOME") && !v.isBlank()) {
+                    roots.add(Path.of(v));
+                }
+            });
             roots.add(Path.of(System.getProperty("java.home")));
             Map<Integer, String> byVersion = new LinkedHashMap<>();
             for (Path root : roots) {
-                for (Path candidate : List.of(root, root.resolve("Contents/Home"))) {
+                // plain layout, macOS bundle, Homebrew formula, scoop "current"
+                for (Path candidate : List.of(root, root.resolve("Contents/Home"), root.resolve("libexec/openjdk.jdk/Contents/Home"),
+                        root.resolve("current"))) {
                     Integer version = releaseVersion(candidate);
                     if (version != null) {
                         byVersion.putIfAbsent(version, candidate.toString());
@@ -281,14 +308,24 @@ public class BuildReport {
             return System.getProperty("os.name").toLowerCase(Locale.ROOT).contains("win");
         }
 
+        /** The file at this relative path in dir or its nearest parent: a module of a bigger build has no wrapper of its own. */
+        static Path findUp(Path dir, String relative) {
+            for (Path d = dir; d != null; d = d.getParent()) {
+                if (Files.exists(d.resolve(relative))) {
+                    return d.resolve(relative);
+                }
+            }
+            return null;
+        }
+
         static List<String> launcher(Path project, String tool) {
             String wrapper = tool.equals("gradle") ? "gradlew" : "mvnw";
             if (windows()) {
-                Path bat = project.resolve(wrapper + (tool.equals("gradle") ? ".bat" : ".cmd"));
-                return List.of("cmd", "/c", Files.exists(bat) ? bat.toString() : (tool.equals("gradle") ? "gradle" : "mvn"));
+                Path bat = findUp(project, wrapper + (tool.equals("gradle") ? ".bat" : ".cmd"));
+                return List.of("cmd", "/c", bat != null ? bat.toString() : (tool.equals("gradle") ? "gradle" : "mvn"));
             }
-            Path script = project.resolve(wrapper);
-            if (Files.exists(script)) {
+            Path script = findUp(project, wrapper);
+            if (script != null) {
                 return Files.isExecutable(script) ? List.of(script.toString()) : List.of("sh", script.toString());
             }
             return List.of(tool.equals("gradle") ? "gradle" : "mvn");
@@ -338,10 +375,30 @@ public class BuildReport {
             return out;
         }
 
+        /**
+         * Kotlin DSL: compiler warnings on the build script ("w: .../build.gradle.kts:49:21: ... deprecated").
+         * Both DSLs: Gradle's own deprecation messages (--warning-mode all), with the location Gradle prints
+         * on the line before ("Build file '/x/build.gradle': line 12").
+         */
         static List<String> buildScriptDeprecations(List<String> lines) {
-            Pattern p = Pattern.compile("^w: .*[/\\\\]([^/\\\\]+\\.gradle(?:\\.kts)?:\\d+:\\d+: .*deprecated.*)$");
-            return lines.stream().map(p::matcher).filter(Matcher::matches).map(m -> m.group(1))
-                .distinct().limit(15).collect(Collectors.toList());
+            Pattern kts = Pattern.compile("^w: .*[/\\\\]([^/\\\\]+\\.gradle(?:\\.kts)?:\\d+:\\d+: .*deprecated.*)$");
+            Pattern where = Pattern.compile("^(?:Build|Settings|Init) file '(?:.*[/\\\\])?([^/\\\\']+)': line (\\d+)$");
+            List<String> out = new ArrayList<>();
+            for (int i = 0; i < lines.size(); i++) {
+                String t = lines.get(i).strip();
+                Matcher k = kts.matcher(t);
+                if (k.matches()) {
+                    out.add(k.group(1));
+                    continue;
+                }
+                if (t.contains(" has been deprecated") && t.contains("scheduled to be removed")) {
+                    String message = t.replaceFirst("\\s+(Consult the upgrading guide|For more information|Documentation:).*$", "");
+                    Matcher w = i > 0 ? where.matcher(lines.get(i - 1).strip()) : null;
+                    out.add((w != null && w.matches() ? w.group(1) + ":" + w.group(2) + ": " : "")
+                        + (message.length() > 200 ? message.substring(0, 200) + "..." : message));
+                }
+            }
+            return out.stream().distinct().limit(15).collect(Collectors.toList());
         }
     }
 
@@ -354,7 +411,12 @@ public class BuildReport {
         Integer javacCount;
 
         static final Pattern ERROR = Pattern.compile("^(?:\\[ERROR\\] )?(.+?\\.(?:java|kt)):(?:\\[(\\d+),\\d+\\]|(\\d+)):? (?:error: )?(.+)$");
+        // kotlinc: "e: file:///x/A.kt:12:5 msg" (Kotlin 1.8+), "e: /x/A.kt: (12, 5): msg" (older),
+        // Maven: "[ERROR] /x/A.kt: (12, 5) msg"; also build scripts (.gradle.kts)
+        static final Pattern KOTLIN = Pattern.compile(
+            "^(?:\\[ERROR\\] )?(?:e: )?(?:file://)?(.+?\\.kts?)(?::(\\d+):\\d+|: \\((\\d+), \\d+\\)|:\\[(\\d+),\\d+\\]):? (.+)$");
         static final Pattern COUNT = Pattern.compile("^(\\d+) errors?$");
+        static final Pattern TEST_SOURCES = Pattern.compile(".*/src/\\w*[Tt]est\\w*/.*");
 
         static Compile parse(List<String> lines, Path project) {
             Compile c = new Compile();
@@ -373,26 +435,38 @@ public class BuildReport {
                     c.javacCount = Integer.parseInt(count.group(1));
                     continue;
                 }
-                if (!t.contains("error")) {
+                // javac "error:", Maven "[ERROR]" (its lines carry no lowercase "error"), kotlinc "e: "
+                if (!(t.contains("error") || t.startsWith("[ERROR]") || t.startsWith("e: "))) {
                     continue;
                 }
+                String file;
+                int line;
+                String message;
                 Matcher m = ERROR.matcher(t);
-                if (!m.matches() || t.startsWith("w:")) {
+                Matcher k = KOTLIN.matcher(t);
+                if (!t.startsWith("e: ") && m.matches()) {
+                    file = m.group(1);
+                    line = Integer.parseInt(m.group(2) != null ? m.group(2) : m.group(3));
+                    message = m.group(4).strip();
+                } else if (k.matches() && (t.startsWith("e: ") || t.startsWith("[ERROR]"))) {
+                    file = k.group(1).replaceFirst("^/([A-Za-z]:)", "$1"); // file:///D:/x -> D:/x
+                    line = Integer.parseInt(k.group(2) != null ? k.group(2) : k.group(3) != null ? k.group(3) : k.group(4));
+                    message = k.group(5).strip();
+                } else {
                     continue;
                 }
-                String file = m.group(1).replace('\\', '/');
-                int line = Integer.parseInt(m.group(2) != null ? m.group(2) : m.group(3));
-                String message = m.group(4).strip();
+                file = file.replace('\\', '/');
                 String symbol = null;
-                for (int j = i + 1; j < Math.min(stop, i + 5); j++) {
+                for (int j = i + 1; message.contains("cannot find symbol") && j < Math.min(stop, i + 5); j++) {
                     String s = lines.get(j).strip().replaceFirst("^\\[ERROR\\]\\s*", "");
                     if (s.startsWith("symbol:")) {
                         symbol = s.substring("symbol:".length()).strip().replaceAll("\\s+", " ");
                         break;
                     }
                 }
-                String location = file.contains("/build/generated/") || file.contains("/target/generated")
-                    ? "generated" : file.contains("/src/test/") ? "test" : "main";
+                String location = file.endsWith(".gradle.kts") ? "build script"
+                    : file.contains("/build/generated/") || file.contains("/target/generated") || file.contains("/build/tmp/kapt")
+                    ? "generated" : TEST_SOURCES.matcher(file).matches() ? "test" : "main";
                 String relative = relativize(project, file);
                 if (seen.add(relative + ":" + line + ":" + message + ":" + symbol)) {
                     c.errors.add(new CompileError(relative, line, message, symbol, location));
@@ -455,32 +529,48 @@ public class BuildReport {
         int skipped;
         final List<Json> failures = new ArrayList<>();
 
-        static Tests collect(Path project, Tool tool, Instant notBefore) {
+        static final Set<String> SKIP = Set.of("src", "node_modules", "gradle", "out", "bin");
+
+        /** JUnit XML reports of every module: build/test-results/* (Gradle), target/surefire-reports and failsafe-reports (Maven). */
+        static Tests collect(Path project, Instant notBefore) {
             Tests t = new Tests();
             List<Path> dirs = new ArrayList<>();
-            if (tool.name().equals("gradle")) {
-                Path results = project.resolve("build/test-results");
-                if (Files.isDirectory(results)) {
-                    try (Stream<Path> s = Files.list(results)) {
-                        s.filter(Files::isDirectory).forEach(dirs::add);
-                    } catch (IOException ignored) {
-                        // no results
+            try {
+                Files.walkFileTree(project, Set.of(), 12, new java.nio.file.SimpleFileVisitor<>() {
+                    @Override
+                    public java.nio.file.FileVisitResult preVisitDirectory(Path dir, java.nio.file.attribute.BasicFileAttributes a) {
+                        String name = dir.getFileName() == null ? "" : dir.getFileName().toString();
+                        if (!dir.equals(project) && (name.startsWith(".") || SKIP.contains(name))) {
+                            return java.nio.file.FileVisitResult.SKIP_SUBTREE;
+                        }
+                        if (name.equals("build") || name.equals("target")) {
+                            try (Stream<Path> s = Files.list(dir.resolve("test-results"))) {
+                                s.filter(Files::isDirectory).forEach(dirs::add);
+                            } catch (IOException ignored) {
+                                // not a Gradle build directory
+                            }
+                            dirs.add(dir.resolve("surefire-reports"));
+                            dirs.add(dir.resolve("failsafe-reports"));
+                            return java.nio.file.FileVisitResult.SKIP_SUBTREE;
+                        }
+                        return java.nio.file.FileVisitResult.CONTINUE;
                     }
-                }
-            } else {
-                dirs.add(project.resolve("target/surefire-reports"));
-                dirs.add(project.resolve("target/failsafe-reports"));
+                });
+            } catch (IOException ignored) {
+                // unreadable tree: report what was found
             }
             for (Path dir : dirs) {
                 if (!Files.isDirectory(dir)) {
                     continue;
                 }
+                String module = project.relativize(dir).toString().replace('\\', '/').replaceFirst("(^|/)(build|target)/.*$", "");
                 try (Stream<Path> files = Files.list(dir)) {
                     for (Path xml : files.filter(f -> f.getFileName().toString().matches("TEST-.*\\.xml")).collect(Collectors.toList())) {
                         if (Files.getLastModifiedTime(xml).toInstant().isBefore(notBefore)) {
                             continue; // stale report from an earlier build
                         }
-                        t.read(xml);
+                        t.modules.add(module.isEmpty() ? "." : module);
+                        t.read(xml, module);
                     }
                 } catch (Exception ignored) {
                     // unreadable report: skip
@@ -489,7 +579,9 @@ public class BuildReport {
             return t;
         }
 
-        void read(Path xml) throws Exception {
+        final Set<String> modules = new LinkedHashSet<>();
+
+        void read(Path xml, String module) throws Exception {
             var factory = DocumentBuilderFactory.newInstance();
             factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);
             Element suite = factory.newDocumentBuilder().parse(xml.toFile()).getDocumentElement();
@@ -515,6 +607,9 @@ public class BuildReport {
                     Json f = new Json();
                     String cls = tc.getAttribute("classname");
                     f.put("test", cls.substring(cls.lastIndexOf('.') + 1) + "." + tc.getAttribute("name"));
+                    if (!module.isEmpty()) {
+                        f.put("module", module);
+                    }
                     f.put("type", problem.getAttribute("type"));
                     f.put("message", message.length() > 300 ? message.substring(0, 300) + "..." : message);
                     failures.add(f);
@@ -537,6 +632,9 @@ public class BuildReport {
             j.put("total", total);
             j.put("failed", failed);
             j.put("skipped", skipped);
+            if (modules.size() > 1) {
+                j.put("modules", new ArrayList<>(modules));
+            }
             if (!failures.isEmpty()) {
                 j.put("failures", failures);
             }
